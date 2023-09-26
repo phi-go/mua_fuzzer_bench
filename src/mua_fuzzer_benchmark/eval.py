@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import pprint
 import sys
 import os
@@ -29,11 +29,16 @@ import logging
 from data_types import ActiveMutants, CheckResultCovered, CheckResultKilled, CheckResultOrigCrash, CheckResultOrigTimeout, CheckResultTimeout, CheckRun, CommonRun, CompileArg, CoveredResult, CrashCheckResult,  FuzzerRun, GatherSeedRun, GatheredSeedsRun, KCovResult, KCovRun, MinimizeSeedRun, Mutation, MutationRun, MutationType, Program, RerunMutations, ResultingRun, RunResult, RunResultKey, SeedRun, SeedRunResult, SuperMutant, SuperMutantUninitialized, check_results_union
 from docker_interaction import DockerLogStreamer, run_exec_in_container, start_mutation_container, start_testing_container, Container
 
-from constants import EXEC_ID, MAX_RETRY_COUNT, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUATATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
+from constants import EXEC_ID, MAX_RETRY_COUNT, MUT_BC_SUFFIX, MUT_LL_SUFFIX, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUTATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
     JUST_SEEDS, STOP_ON_MULTI, SKIP_LOCATOR_SEED_CHECK, CHECK_INTERVAL, \
     HOST_TMP_PATH, UNSOLVED_MUTANTS_DIR, IN_DOCKER_WORKDIR, SHARED_DIR, IN_DOCKER_SHARED_DIR
 from helpers import CoveredFile, fuzzer_container_tag, get_seed_dir, hash_file, load_fuzzers, load_programs, mutation_detector_path, mutation_locations_path, mutation_prog_source_path, shared_dir_to_docker, subject_container_tag
 from db import ReadStatsDb, Stats
+
+class RerunMutationsDict(TypedDict):
+    prog: str
+    mutation_ids: List[int]
+    mode: str
 
 # set up logging to file
 logging.basicConfig(
@@ -880,11 +885,6 @@ def get_all_mutations(
         rerun = None
 
     if rerun_mutations_p is not None:
-        class RerunMutationsDict(TypedDict):
-            prog: str
-            mutation_ids: List[int]
-            mode: str
-
         with open(rerun_mutations_p, 'rt') as f:
             rerun_mutations_data: List[RerunMutationsDict] = json.load(f)
             rerun_mutations = {
@@ -1008,7 +1008,8 @@ def get_all_mutations(
             
         else:
             # supermutations, graph_info = get_supermutations_simple_reachable(prog_info, mutations)
-            covered = get_supermutations_seed_reachable(prog, prog_info, mutations, mutator, seed_base_dir, fuzzers)
+            covered = get_supermutations_seed_reachable(
+                prog, prog_info, mutations, mutator, seed_base_dir, fuzzers)
             stats.new_supermutant_graph_info(EXEC_ID, prog, covered)
             supermutations = covered.supermutants
 
@@ -1016,7 +1017,7 @@ def get_all_mutations(
             stats.new_initial_supermutant(EXEC_ID, prog, ii, sms)
 
         s_mutations = list(
-            SuperMutantUninitialized(sm, prog_info) # , mutation_data)
+            SuperMutantUninitialized(sm, prog_info)
             for sm in supermutations
         )
 
@@ -2096,8 +2097,8 @@ def prepare_mutation(core_to_use: int, data: MutationRun) -> None:
     mut_base_dir = data.mut_data.get_mut_base_dir()
     mut_base_dir.mkdir(parents=True, exist_ok=True)
 
-    prog_bc_name = (Path(data.mut_data.prog.orig_bc).with_suffix(f".ll.mut.bc").name)
-    prog_ll_name = (Path(data.mut_data.prog.orig_bc).with_suffix(f".ll.mut.ll").name)
+    prog_bc_name = (Path(data.mut_data.prog.orig_bc).with_suffix(MUT_BC_SUFFIX).name)
+    prog_ll_name = (Path(data.mut_data.prog.orig_bc).with_suffix(MUT_LL_SUFFIX).name)
     prog_bc = mut_base_dir/prog_bc_name
     prog_ll = mut_base_dir/prog_ll_name
 
@@ -2179,8 +2180,8 @@ def print_mutation_prepare_start_msg(super_mutant: MutationRun) -> bool:
     mut_data = super_mutant.mut_data
     fuzzer_runs = super_mutant.resulting_runs
     fuzzers = " ".join(set(ff.run.fuzzer.name for ff in fuzzer_runs))
-    num_repeats = max(ff.run.run_ctr for ff in fuzzer_runs) + 1
-    logger.info(f"> mutation:     {mut_data.prog.name}:{mut_data.printable_m_id()} - {num_repeats} - {fuzzers} " +
+    # num_repeats = max(ff.run.run_ctr for ff in fuzzer_runs) + 1
+    logger.info(f"> mutation:     {mut_data.prog.name}:{mut_data.printable_m_id()} - {fuzzers} " +
                 f"(num muts: {len(mut_data.mutation_ids)})")
     return True
 
@@ -2276,6 +2277,7 @@ def build_subject_docker_images(progs: List[str]) -> None:
 
 def build_docker_images(fuzzers: List[str], progs: List[str]) -> None:
     # build testing image
+    logger.info(f"Building mutator_testing image.")
     proc = subprocess.run([
             "docker", "build",
             "-t", "mutator_testing",
@@ -2512,6 +2514,445 @@ def run_eval(
 
     # Copy the stats db to the result path
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(tmp_db_path, result_path)
+
+
+def get_mutation_locator_and_data(
+    stats: Stats,
+    mutator: Container,
+    progs: List[str],
+) -> List[Tuple[str, Path, Path]]:
+    "Get the mutation locator executable and the data for all mutations."
+
+    progs_locator = []
+
+    for prog in progs:
+        try:
+            prog_info = PROGRAMS[prog]
+        except Exception as err:
+            logger.error(err)
+            logger.error(f"Prog: {prog} is not known, known progs are: {PROGRAMS.keys()}")
+            sys.exit(1)
+        start = time.time()
+        logger.info("="*50)
+        logger.info(f"Compiling base and locating mutations for {prog}")
+
+        instrument_result = instrument_prog(mutator, prog_info)
+
+        # get info on mutations
+        with open(mutation_locations_path(prog_info), 'rt') as f:
+            mutation_data: List[Dict[str, str]] = json.load(f)
+
+        mutations = list(new_mutation(int(p['UID']), p, prog_info) for p in mutation_data)
+
+        # Remove mutations for functions that should not be mutated
+        omit_functions = prog_info.omit_functions
+        mutations = [mm for mm in mutations if mm.funname not in omit_functions]
+
+        bc_path = Path(prog_info.orig_bc)
+        detector_path = mutation_detector_path(prog_info)
+
+        stats.new_prog(EXEC_ID, prog, prog_info)
+
+        logger.info(f"Found {len(mutations)} mutations for {prog}")
+        for mut in mutations:
+            stats.new_mutation(EXEC_ID, mut)
+
+        progs_locator.append((prog, bc_path, detector_path))
+
+    return progs_locator
+
+        
+def get_mutation_locator_mutations(
+    stats: Stats,
+    statsdb: ReadStatsDb,
+    mutation_list: Dict[str, RerunMutations],
+    progs: List[str],
+) -> List[Mutation]:
+    all_mutations: List[Mutation] = []
+    # For all programs that can to be done by the evaluation.
+    for prog in progs:
+        try:
+            prog_info = PROGRAMS[prog]
+        except Exception as err:
+            logger.error(err)
+            logger.error(f"Prog: {prog} is not known, known progs are: {PROGRAMS.keys()}")
+            sys.exit(1)
+        start = time.time()
+        logger.info("="*50)
+        logger.info(f"Compiling base and locating mutations for {prog}")
+
+        load_rerun_prog(statsdb, prog, prog_info)
+
+        stats.new_prog(EXEC_ID, prog, prog_info)
+
+        # get info on mutations
+        with open(mutation_locations_path(prog_info), 'rt') as f:
+            mutation_data: List[Dict[str, str]] = json.load(f)
+
+        if len(mutation_data) == 0:
+            msg = f"No mutations found for {prog}.\n"
+            raise ValueError(msg)
+
+        mutations = list(new_mutation(int(p['UID']), p, prog_info) for p in mutation_data)
+
+        # Remove mutations for functions that should not be mutated
+        omit_functions = prog_info.omit_functions
+        # mutations = [mm for mm in mutations if mm.funname not in omit_functions]
+
+        # If rerun_mutations is specified, collect those mutations
+        mutations_dict = {int(mm.mutation_id): mm for mm in mutations}
+        rerun_chosen_mutations: List[Mutation] = []
+        rerun_mutations_for_prog = mutation_list[prog].mutation_ids
+        for mtu in rerun_mutations_for_prog:
+            assert mtu in mutations_dict.keys(), "Can not find specified rerun mutation id in mutations for prog."
+            mut = mutations_dict[mtu]
+            if mut.funname in omit_functions:
+                logger.info(f"Skipping mutation id: {mut.mutation_id} because it is in function {mut.funname} which is a omitted function.")
+                continue
+            rerun_chosen_mutations.append(mutations_dict[mtu])
+
+        logger.info(f"Found {len(rerun_chosen_mutations)} selected mutations for {prog}")
+        for mut in rerun_chosen_mutations:
+            stats.new_mutation(EXEC_ID, mut)
+
+        all_mutations.extend(rerun_chosen_mutations)
+        logger.info(f"Preparations for {prog} took: {time.time() - start:.2f} seconds")
+
+    return all_mutations
+
+
+def locator(
+    progs: List[str],
+    fresh_images: bool,
+    result_path_s: str,
+) -> None:
+    result_path = Path(result_path_s)
+    assert not result_path.exists(), f"Result path {result_path} already exists."
+
+    prepare_mutator_docker_image(fresh_images)
+    prepare_shared_dir_and_tmp_dir()
+
+    execution_start_time = time.time()
+
+    # prepare environment
+    base_shm_dir = SHARED_DIR/"mua_locator"
+    base_shm_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize the stats object
+    tmp_db_path = SHARED_DIR/"mua_locator/stats.db"
+    stats = Stats(str(tmp_db_path))
+
+    # Record current eval execution data
+    # Get the current git status
+    git_status = get_git_status()
+    stats.new_execution(
+        EXEC_ID, platform.uname()[1], git_status, None, execution_start_time,
+        json.dumps({ # type: ignore[misc]
+            'progs': progs,
+        }),
+        json.dumps({k: v for k, v in os.environ.items()}) # type: ignore[misc]
+    )
+
+    class MutationDocEntry(TypedDict):
+        pattern_name: str
+        typeID: int
+        pattern_location: str
+        pattern_class: str
+        description: str
+        procedure: str
+
+    # Get a record of all mutation types.
+    with open("mutation_doc.json", "rt") as f:
+        mutation_types: List[MutationDocEntry] = json.load(f)
+        for mt in mutation_types:
+            mutation_type = MutationType(
+                pattern_name=mt['pattern_name'],
+                type_id=mt['typeID'],
+                pattern_location=mt['pattern_location'],
+                pattern_class=mt['pattern_class'],
+                description=mt['description'],
+                procedure=mt['procedure'],
+            )
+            stats.new_mutation_type(mutation_type)
+
+    build_docker_images([], progs)
+
+    with start_mutation_container(None, 24*60*60) as mutator:
+        locators = get_mutation_locator_and_data(stats, mutator, progs)
+
+    for prog, bc_path, locator in locators:
+        result_prog_path = result_path/"progs"/f"{prog}"
+        result_prog_path.mkdir(parents=True, exist_ok=False)
+        result_locator_path = result_prog_path/"locator"
+        shutil.copy(locator, result_locator_path)
+        result_bc_path = result_prog_path/"bc"
+        shutil.copy(bc_path, result_bc_path)
+        print(f"bc and locator for {prog} copied to {result_locator_path}")
+
+    shutil.copytree(HOST_TMP_PATH/"lib", result_path/"lib")
+    print(f"lib copied to {result_path/'lib'}")
+
+    # Record total time for this execution.
+    stats.execution_done(EXEC_ID, time.time() - execution_start_time)
+
+    result_path.mkdir(parents=True, exist_ok=True)
+    # Copy the stats db to the result path
+    result_db_path = result_path.joinpath("stats.db")
+    shutil.copy(tmp_db_path, result_db_path)
+
+
+def handle_mutation_compile_result(
+    stats: Stats,
+    prepared_runs: PreparedRuns,
+    task_future: Future[Optional[RunResult]],
+    data: MutationRun,
+    result_dir: Path,
+) -> None:
+    mut_data = data.mut_data
+    resulting_runs = data.resulting_runs
+    prog_bc = data.get_prog_bc()
+
+    logger.debug(f"mut finished for: {prog_bc}")
+    prog = mut_data.prog
+    mutation_ids = mut_data.mutation_ids
+
+    try:
+        # Check if there was an exception.
+        res = task_future.result()
+        assert res is None
+    except Exception:
+        trace = traceback.format_exc()
+        supermutant_id = mut_data.supermutant_id
+        if len(mutation_ids) > 1:
+            # If there was an exception for multiple mutations, retry with less.
+            chunk_1, chunk_2 = split_up_supermutant_by_distance(mutation_ids)
+
+            logger.info(f"= mutation ###:      {mut_data.prog.name}:{mut_data.printable_m_id()}\n"
+                  f"rerunning in two chunks with len: {len(chunk_1)}, {len(chunk_2)}")
+            logger.debug(trace)
+            stats.supermutation_preparation_crashed(EXEC_ID, prog.name, supermutant_id, trace)
+
+            recompile_and_run_from_mutation(prepared_runs, mut_data, copy.deepcopy(resulting_runs), stats.next_supermutant_id(), chunk_1)
+            recompile_and_run_from_mutation(prepared_runs, mut_data, copy.deepcopy(resulting_runs), stats.next_supermutant_id(), chunk_2)
+        else:
+            # Else record it.
+            logger.info(f"= mutation ###: crashed {prog.name}:{mut_data.printable_m_id()}")
+            logger.debug(trace)
+            stats.supermutation_preparation_crashed(EXEC_ID, prog.name, supermutant_id, trace)
+            for mutation_id in mutation_ids:
+                stats.mutation_preparation_crashed(EXEC_ID, prog.name, supermutant_id, mutation_id)
+
+        # Nothing more to do.
+        return
+
+    # Copy to result dir and remove tmp dir.
+    prog_name = data.mut_data.prog.name
+    mutation_ids_l = list(data.mut_data.mutation_ids)
+    assert len(mutation_ids_l) == 1, mutation_ids_l
+    mutation_id = mutation_ids_l[0]
+
+    mua_tmp_dir = data.mut_data.get_mut_base_dir()
+    mua_result_dir = result_dir/prog_name/str(mutation_id)
+
+    # remove .ll as it is big and redundant
+    tmp_ll_file_candidates = list(mua_tmp_dir.glob("*" + MUT_LL_SUFFIX))
+    assert len(tmp_ll_file_candidates) == 1, tmp_ll_file_candidates
+    tmp_ll_file = tmp_ll_file_candidates[0]
+    try:
+        tmp_ll_file.unlink()
+    except Exception as err:
+        logger.error(f"Could not remove {tmp_ll_file}.")
+        logger.error(err)
+        raise err
+
+    try:
+        mua_result_dir.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as err:
+        logger.error(f"Could not create {mua_result_dir.parent}.")
+        logger.error(err)
+        raise err
+
+    try:
+        shutil.copytree(mua_tmp_dir, mua_result_dir)
+    except Exception as err:
+        logger.error(f"Could not copy {mua_tmp_dir} to {mua_result_dir}.")
+        logger.error(err)
+        raise err
+
+    try:
+        shutil.rmtree(mua_tmp_dir)
+    except Exception as err:
+        logger.error(f"Could not remove {mua_tmp_dir}.")
+        logger.error(err)
+        raise err
+
+    logger.info(f"= mutation [+]: {prog.name}:{mut_data.printable_m_id()}")
+
+
+def wait_for_compile_task(
+    stats: Stats,
+    tasks: tasks_type,
+    cores: CpuCores,
+    prepared_runs: PreparedRuns,
+    result_dir: Path,
+) -> None:
+    "Wait for a task to complete and process the result."
+    if len(tasks) == 0:
+        logger.info("WARN: Trying to wait for a task but there are none.")
+        logger.info(cores.cores)
+        return
+
+    # wait for a task to complete
+    completed_task = next(concurrent.futures.as_completed(tasks))
+    # get the data associated with the task and remove the task from the list
+    task = tasks[completed_task]
+    del tasks[completed_task]
+
+    core = task.core
+    task_type = task.data.run_type
+
+    # free the core for future use
+    cores.release_core(core)
+
+    # handle the task result
+    if task_type == "mut":
+        data = task.data.get_mut_run()
+        handle_mutation_compile_result(
+            stats, prepared_runs, completed_task, data, result_dir)
+    else:
+        raise ValueError("Unknown task type.")
+
+
+def locator_mutants(
+    statsdb_s: str,
+    mutation_list_s: str,
+    result_path_s: str,
+) -> None:
+    result_path = Path(result_path_s)
+    assert not result_path.exists(), f"Result path {result_path} already exists."
+    result_path.mkdir(parents=True, exist_ok=False)
+
+    prepare_mutator_docker_image(False)
+    prepare_shared_dir_and_tmp_dir()
+
+    execution_start_time = time.time()
+
+    # prepare environment
+    base_shm_dir = SHARED_DIR/"mua_locator_mutants"
+    base_shm_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize the stats object
+    tmp_db_path = SHARED_DIR/"mua_locator_mutants/stats.db"
+    stats = Stats(str(tmp_db_path))
+
+    # Record current eval execution data
+    # Get the current git status
+    git_status = get_git_status()
+    stats.new_execution(
+        EXEC_ID, platform.uname()[1], git_status, None, execution_start_time,
+        json.dumps({ # type: ignore[misc]
+            'statsdb': statsdb_s, 'mutation_list': mutation_list_s,
+        }),
+        json.dumps({k: v for k, v in os.environ.items()}) # type: ignore[misc]
+    )
+
+    class MutationDocEntry(TypedDict):
+        pattern_name: str
+        typeID: int
+        pattern_location: str
+        pattern_class: str
+        description: str
+        procedure: str
+
+    # Get a record of all mutation types.
+    with open("mutation_doc.json", "rt") as f:
+        mutation_types: List[MutationDocEntry] = json.load(f)
+        for mt in mutation_types:
+            mutation_type = MutationType(
+                pattern_name=mt['pattern_name'],
+                type_id=mt['typeID'],
+                pattern_location=mt['pattern_location'],
+                pattern_class=mt['pattern_class'],
+                description=mt['description'],
+                procedure=mt['procedure'],
+            )
+            stats.new_mutation_type(mutation_type)
+
+    statsdb_p = Path(statsdb_s)
+    statsdb = ReadStatsDb(statsdb_p)
+
+    with open(mutation_list_s, "rt") as f:
+        mutation_list_data: List[RerunMutationsDict] = json.load(f)
+        mutation_list = {
+            rm['prog']: RerunMutations(
+                prog=rm['prog'],
+                mutation_ids=rm['mutation_ids'],
+                mode=rm['mode'])
+            for rm in mutation_list_data
+        }
+        del mutation_list_data
+    
+
+    progs = list(mutation_list.keys())
+
+    build_docker_images([], progs)
+
+    prog_mutations = get_mutation_locator_mutations(
+        stats, statsdb, mutation_list, progs)
+
+    def mutation_to_mutation_run(mutation: Mutation) -> MutationRun:
+        return MutationRun(
+            mut_data=SuperMutant(
+                supermutant_id=stats.next_supermutant_id(),
+                mutation_ids=set([mutation.mutation_id]),
+                prog=mutation.prog,
+                compile_args=mutation.prog.bc_compile_args + mutation.prog.bin_compile_args,
+                args="@@",
+                seed_base_dir=Path(),
+                previous_supermutant_ids=[]
+            ),
+            resulting_runs=[],
+            check_run=False,
+        )
+
+    mutation_runs = [mutation_to_mutation_run(mutation) for mutation in prog_mutations]
+
+    cores = CpuCores(NUM_CPUS)
+
+    # for each mutation and for each fuzzer do a run
+    with ThreadPoolExecutor(max_workers=NUM_CPUS) as executor:
+        # keep a list of all tasks
+        tasks: tasks_type = {}
+        # a list of currently prepared but not yet started runs
+        prepared_runs = PreparedRuns()
+        # start time
+        start_time = time.time()
+        num_runs = len(mutation_runs)
+        all_runs: enumerate[MutationRun] = enumerate(mutation_runs)
+        ii = 0
+
+        while True:
+            # Check if a core is free, if so start next task.
+            core = cores.try_reserve_core()
+            if core is not None and should_run:
+                ii = start_next_task(prepared_runs, all_runs, tasks, executor, stats, start_time, num_runs, core, ii)
+                # add tasks while there are more free cores
+                if cores.has_free():
+                    continue
+
+            # If all tasks are done, stop.
+            if len(tasks) == 0:
+                break
+            # All tasks have been added, wait for a task to complete.
+            wait_for_compile_task(stats, tasks, cores, prepared_runs, result_path)
+
+    # Record total time for this execution.
+    stats.execution_done(EXEC_ID, time.time() - execution_start_time)
+
+    logger.info(f"eval done, copying db to: {result_path}")
+
+    # Copy the stats db to the result path
     shutil.copy(tmp_db_path, result_path)
 
 
@@ -3383,7 +3824,7 @@ def prepare_mutator_docker_image(fresh_images: bool) -> None:
             raise ValueError("Could not run command.")
 
     # build llvm image
-    logger.info("Building LLVM container.")
+    logger.info(f"Building {MUTATOR_LLVM_IMAGE_NAME} image.")
     run_command([
         "docker", "build",
         *(["--pull", "--no-cache"] if fresh_images else []),
@@ -3391,11 +3832,11 @@ def prepare_mutator_docker_image(fresh_images: bool) -> None:
         "-f", MUTATOR_LLVM_DOCKERFILE_PATH, "."
     ])
 
-    logger.info("Building mutator container.")
+    logger.info(f"Building {MUTATOR_MUTATOR_IMAGE_NAME} image.")
     run_command([
         "docker", "build",
         *(["--no-cache"] if fresh_images else []),
-        "-t", MUTATOR_MUATATOR_IMAGE_NAME,
+        "-t", MUTATOR_MUTATOR_IMAGE_NAME,
         "-f", MUTATOR_MUTATOR_DOCKERFILE_PATH, "."
     ])
 
@@ -3650,6 +4091,41 @@ def main() -> None:
         help='The db to prepare.')
     del parser_prepare_db
 
+    # CMD: locator 
+    parser_locator = subparsers.add_parser('locator',
+        help="Compile the locator executables and get mutation data for the " +
+            "requested programs (--progs).")
+    parser_locator.add_argument("--progs", nargs='+', required=True,
+        help='The programs to compile, will fail if the name is not known.')
+    parser_locator.add_argument("--result-path", required=True,
+        help='The path where the result database and locator executables ' +
+             'should be written to.')
+    parser_locator.add_argument("--fresh-images", default=False, action="store_true",
+        help='If the docker images should be rebuild from scratch. This will call pull on the base images, and build with --no-cache.')
+    del parser_locator
+
+    # CMD: locator_mutants 
+    subparser = subparsers.add_parser('locator_mutants',
+        help="Run the evaluation executing the requested fuzzers (--fuzzers) on "
+             "the requested programs (--progs) and gather the resulting data.")
+    subparser.add_argument("--result-path", required=True,
+        help='The path where the result database should be written to. The path '
+         'will checked to not exist. The extension will be overwritten with ".db". '
+         'Note that the database will only be copied to this location once the '
+         'evaluation finishes.')
+    subparser.add_argument("--statsdb", required=True,
+        help="Rerun a previous experiment based on that runs database. "
+             "Requires a path to the database as the argument. "
+             "The rerun is done by restoring the bitcode and mutationlocation files "
+             "as well as the supermutants for each program.")
+    subparser.add_argument("--mutation-list", required=True,
+        help="Path to a json file containing a list of mutation ids for each program to rerun, "
+             "as well as a mode specifying if the original supermutants should be restored (keep) or each "
+             "mutation should be analyzed individually (single). "
+             "Requires the --rerun option to be used. Example: "
+             '{["prog": "<prog>", "ids": [1, 2, 3], "mode": "single"}]')
+    del subparser
+
     args = parser.parse_args()
 
     cmd = args.cmd
@@ -3671,6 +4147,10 @@ def main() -> None:
                             args.full_supermutants, args.mode)
     elif cmd == 'prepare_db':
         prepare_db(args.db)
+    elif cmd == 'locator':
+        locator(args.progs, args.fresh_images, args.result_path)
+    elif cmd == 'locator_mutants':
+        locator_mutants(args.statsdb, args.mutation_list, args.result_path)
     else:
         parser.print_help(sys.stderr)
 

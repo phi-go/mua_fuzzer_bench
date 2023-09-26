@@ -45,6 +45,9 @@ CHECK_INTERVAL = 5
 # The path where eval data is stored outside of the docker container
 HOST_TMP_PATH = Path(".").resolve()/"tmp/"
 
+MUT_BC_SUFFIX = ".ll.mut.bc"
+MUT_LL_SUFFIX = ".ll.mut.ll"
+
 # Directy where unsolved mutants are collected
 UNSOLVED_MUTANTS_DIR = HOST_TMP_PATH/"unsolved_mutants"
 
@@ -67,7 +70,7 @@ MAX_RETRY_COUNT = 3
 MUTATOR_LLVM_DOCKERFILE_PATH = "dockerfiles/mutator/Dockerfile.llvm"
 MUTATOR_MUTATOR_DOCKERFILE_PATH = "dockerfiles/mutator/Dockerfile.mutator"
 MUTATOR_LLVM_IMAGE_NAME = "mutator_deps:2004"
-MUTATOR_MUATATOR_IMAGE_NAME = "mutator_mutator:latest"
+MUTATOR_MUTATOR_IMAGE_NAME = "mutator_mutator:latest"
 
 BLOCK_SIZE = 1024*4
 
