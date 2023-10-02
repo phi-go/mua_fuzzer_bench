@@ -63,9 +63,15 @@ tasks.withType(LinkSharedLibrary).configureEach {
     linkerArgs.add "-v"
     // Beware!! Only link the llvm libraries dynamically, static linking will cause opt to not register the pass correctly
     // (even if the compilation itself is successful)!
-    linkerArgs.add "-lLLVM"
+    linkerArgs.addAll llvmConfigVariable('libs')
     linkerArgs.addAll llvmConfigVariable('ldflags')
     linkerArgs.addAll llvmConfigVariable('system-libs')
+    // linkerArgs.add '-lLLVMCore'
+    // linkerArgs.add '-lLLVMRemarks'
+    // linkerArgs.add '-lLLVMBitstreamReader'
+    // linkerArgs.add '-lLLVMBinaryFormat'
+    // linkerArgs.add '-lLLVMSupport'
+    // linkerArgs.add '-lLLVMDemangle'
 }
 
 model {

@@ -729,47 +729,47 @@ public:
 };
 
 
-class PrintfPattern: public LibCFailPattern{
-public:
-    using LibCFailPattern::LibCFailPattern;
-    std::vector<std::string>
-    find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
-    bool mutate (
-            IRBuilder<>* builder,
-            IRBuilder<>* nextInstructionBuilder,
-            Instruction* instr,
-            std::mutex& builderMutex,
-            Module& M
-    ) override;
-};
+// class PrintfPattern: public LibCFailPattern{
+// public:
+//     using LibCFailPattern::LibCFailPattern;
+//     std::vector<std::string>
+//     find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
+//     bool mutate (
+//             IRBuilder<>* builder,
+//             IRBuilder<>* nextInstructionBuilder,
+//             Instruction* instr,
+//             std::mutex& builderMutex,
+//             Module& M
+//     ) override;
+// };
 
-class SPrintfPattern: public LibCFailPattern{
-public:
-    using LibCFailPattern::LibCFailPattern;
-    std::vector<std::string>
-    find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
-    bool mutate (
-            IRBuilder<>* builder,
-            IRBuilder<>* nextInstructionBuilder,
-            Instruction* instr,
-            std::mutex& builderMutex,
-            Module& M
-    ) override;
-};
+// class SPrintfPattern: public LibCFailPattern{
+// public:
+//     using LibCFailPattern::LibCFailPattern;
+//     std::vector<std::string>
+//     find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
+//     bool mutate (
+//             IRBuilder<>* builder,
+//             IRBuilder<>* nextInstructionBuilder,
+//             Instruction* instr,
+//             std::mutex& builderMutex,
+//             Module& M
+//     ) override;
+// };
 
-class SNPrintfPattern: public LibCFailPattern{
-public:
-    using LibCFailPattern::LibCFailPattern;
-    std::vector<std::string>
-    find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
-    bool mutate (
-            IRBuilder<>* builder,
-            IRBuilder<>* nextInstructionBuilder,
-            Instruction* instr,
-            std::mutex& builderMutex,
-            Module& M
-    ) override;
-};
+// class SNPrintfPattern: public LibCFailPattern{
+// public:
+//     using LibCFailPattern::LibCFailPattern;
+//     std::vector<std::string>
+//     find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) override;
+//     bool mutate (
+//             IRBuilder<>* builder,
+//             IRBuilder<>* nextInstructionBuilder,
+//             Instruction* instr,
+//             std::mutex& builderMutex,
+//             Module& M
+//     ) override;
+// };
 
 class ReassignStoreInstructionPattern: public Pattern{
 public:

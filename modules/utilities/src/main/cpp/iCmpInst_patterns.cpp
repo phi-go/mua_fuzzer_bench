@@ -70,7 +70,10 @@ bool SignedLessThanEqualToPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, 8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
+                    // can be replaced with:
+                    // cast<PointerType>(rhs->getType())->getElementType()->getPointerElementType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_square_add");
@@ -187,7 +190,8 @@ bool SignedLessThanPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, 8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_square_add");
@@ -303,7 +307,8 @@ bool UnsignedLessThanEqualToPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, 8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_square_add");
@@ -423,7 +428,8 @@ bool UnsignedLessThanPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, 8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_square_add");
@@ -535,7 +541,8 @@ bool SignedGreaterThanPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, -8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_root_half_sub");
@@ -693,7 +700,8 @@ bool SignedGreaterThanEqualToPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, -8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_root_half_sub");
@@ -853,7 +861,8 @@ bool UnsignedGreaterThanPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, -8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_root_half_sub");
@@ -1011,7 +1020,8 @@ bool UnsignedGreaterThanEqualToPattern::mutate(
                 LLVMContext &llvmContext = M.getContext();
                 auto int_type = IntegerType::get (llvmContext, 32);
                 Value* indexList = ConstantInt::get(int_type, -8);
-                newVal = builder->CreateGEP(rhs, indexList);
+                newVal = builder->CreateGEP(
+                    rhs->getType(), rhs, indexList);
             }
             else if (rhs->getType()->isIntegerTy()){
                 newVal = insertMutationFunctionCall(rhs, builder, M, "mutate_root_half_sub");

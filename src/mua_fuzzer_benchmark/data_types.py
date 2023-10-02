@@ -558,3 +558,13 @@ class ActiveMutants:
 
     def is_killed(self, path: Path) -> bool:
         return cast(bool, self.mutants[path]['killed'])
+
+
+@dataclass
+class LocalProgramConfig:
+    name: str
+    bc_compile_args: List[CompileArg]
+    bin_compile_args: List[CompileArg]
+    is_cpp: bool
+    orig_bc: Path
+    omit_functions: List[str]

@@ -15,9 +15,15 @@ linked_libraries = "dynamiclibrary"
 SYSROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/"
 
 def run(args, **kwargs):
-    print(args, kwargs, flush=True)
+    print("====")
+    print(shlex.join(args), kwargs, flush=True)
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
-    print(proc.stdout.decode(), flush=True)
+    if proc.returncode == 0:
+        print("SUCCESS", flush=True)
+    else:
+        print("ERROR:", proc.returncode, flush=True)
+        print(proc.stdout.decode(), flush=True)
+        sys.exit(proc.returncode)
     return proc
 
 def compile_and_find(args):
@@ -44,32 +50,44 @@ def compile_and_find(args):
     if uname.sysname== "Darwin" and int(uname.release.split('.')[0]) >= 19:
         # if (uname["release"]):
         run([clang, "-g", "-S", "-D_FORTIFY_SOURCE=0", "-isysroot",
-                         f"{SYSROOT}", "-emit-llvm",
-                         *bc_args, progsource,
-                         "-o", f"{progsource}.ll"])
+                        f"{SYSROOT}", "-emit-llvm",
+                        *bc_args, 
+                        "-fPIE",
+                        progsource,
+                        "-o", f"{progsource}.ll"])
     else:
         run([clang, "-g", "-S", "-D_FORTIFY_SOURCE=0", "-emit-llvm",
-                        *bc_args, progsource,
+                        *bc_args,
+                        "-fPIE",
+                        progsource,
                         "-o", f"{progsource}.ll"])
 
     # "${LLVM}/opt" -S -instnamer -reg2mem -load "${TRACEPLUGIN}" -traceplugin -exclude_functions "${EXCLUDED_FUNCTIONS}" -disable-verify "${PROG_SOURCE}.uninstrumented.bc" -o  "${PROG_SOURCE}.opt_debug.bc"
 
     # Do the analysis for possible mutations.
+    # "-load", mutatorplugin, 
+    #  "-load-pass-plugin", mutatorplugin, '-passes="mutationfinder"',
     with open(f"{progsource}.ll", "r") as progsource_file:
-        sp_call_args = [opt, "-S", "-load", mutatorplugin, "-mutationfinder",
-            "-mutation_patterns", f"{progsource}.mutationlocations",  "-disable-verify",
-            "-o", f"{progsource}.opt_mutate.ll"]
+        sp_call_args = [
+            opt,
+            "-S",
+            "--load", mutatorplugin,
+            "--load-pass-plugin", mutatorplugin,
+            '--passes=mutationfinder',
+            "-mutation-patterns", f"{progsource}.mutationlocations",
+            # "-disable-verify",
+            "-o", f"{progsource}.opt_mutate.ll", "--debug-pass-manager"]
         if is_cpp:
             sp_call_args.append("-cpp")
 
-        subprocess.call(sp_call_args, stdin=progsource_file)
+        run(sp_call_args, stdin=progsource_file)
 
     # compile to a binary to find out what mutations could possibly be triggered
     print("Now Compile!")
     arguments = [
-        # "-v",
+        "-v",
         f"{progsource}.opt_mutate.ll", # input file
-        *bc_args,
+        # *bc_args,
         *bin_args,
         f"-L{dynamic_libraries_folder}", # points the runtime linker to the location of the included shared library
         "-lm", "-lz", "-ldl", # some often used libraries

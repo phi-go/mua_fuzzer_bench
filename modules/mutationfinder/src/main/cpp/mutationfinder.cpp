@@ -1,36 +1,49 @@
+#include "pattern_lib.h"
+
+// #include <llvm/Pass.h>
+// #include <llvm/IR/Type.h>
+// #include <llvm/IR/Module.h>
+// #include <llvm/IR/IntrinsicInst.h>
+// #include <llvm/IR/Function.h>
+// #include <llvm/Support/raw_ostream.h>
+// #include <llvm/Support/CommandLine.h>
+
+// #include "llvm/IR/LegacyPassManager.h"
+// #include "llvm/IR/PassManager.h"
+// #include "llvm/Passes/PassPlugin.h"
+// #include "llvm/Passes/PassBuilder.h"
+// #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include <iostream>
 #include <fstream>
 #include <map>
 #include <thread>
 
-#include "pattern_lib.h"
-
-#include <llvm/Pass.h>
-#include <llvm/IR/Type.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/IntrinsicInst.h>
-#include <llvm/IR/Function.h>
-#include <llvm/Support/raw_ostream.h>
-#include <llvm/Support/CommandLine.h>
-
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
-
 using namespace llvm;
 
 #define DEBUG_TYPE "mutationfinder"
 
-cl::opt<std::string> MutationLocationFile("mutation_patterns",
-                                   cl::desc("file containing the mutation patterns"),
-                                   cl::value_desc("filename"));
-cl::opt<bool> CPP ("cpp", cl::desc("Enable CPP-only mutations"));
 namespace {
+
+static cl::opt<std::string> MutationLocationFile{
+    "mutation-patterns",
+    cl::desc("file containing the mutation patterns"),
+    cl::value_desc("filename")};
+
+static cl::opt<bool> CPP ("cpp", cl::desc("Enable CPP-only mutations"));
+
 // a counter and the number of functions to print the current status
 int number_functions = 0;
 int funcounter = 0;
 
 std::ofstream mutationLocationsstream;
 std::vector<std::string> mutationLocationsvector;
+using json = nlohmann::json;
 json callgraph;
 
 class Worker
@@ -71,9 +84,6 @@ public:
         }
     }
 
-
-
-
     /**
      * Instrument the given instruction with the given builders.
      * @param instr
@@ -112,7 +122,6 @@ public:
         }
     }
 
-
     /**
      * Instrument one function, i.e. run over all instructions in that function and instrument them.
      * @param F the given function
@@ -145,30 +154,45 @@ public:
                 std::string result;
                 if (fun != nullptr) {
                     if (!fun->isIntrinsic()) {
-                       result += fun->getName().str() + " | ";
-                       std::string type_str;
-                       llvm::raw_string_ostream rso(type_str);
-                       callinst->getType()->print(rso);
-                       result += rso.str() + " | ";
-                       for (int i = 0; i < callinst->getNumArgOperands(); i++) {
-                           std::string type_str_inner;
-                           llvm::raw_string_ostream rso_inner(type_str_inner);
-                           callinst->getArgOperand(i)->getType()->print(rso_inner);
-                           result +=  rso_inner.str() + " | ";
-                       }
-                       funNameArray.push_back(result);
+                        result += fun->getName().str() + " | ";
+                        std::string type_str;
+                        llvm::raw_string_ostream rso(type_str);
+                        callinst->getType()->print(rso);
+                        result += rso.str() + " | ";
+                        for (auto arg = callinst->arg_begin(); arg != callinst->arg_end(); ++arg) {
+                            std::string type_str_inner;
+                            llvm::raw_string_ostream rso_inner(type_str_inner);
+                            arg->get()->getType()->print(rso_inner);
+                            result += rso_inner.str() + " | ";
+                        }
+                        funNameArray.push_back(result);
                     }
+                    // for (int i = 0; i < callinst->getNumOperands(); i++) {
+                    //        std::string type_str_inner;
+                    //        llvm::raw_string_ostream rso_inner(type_str_inner);
+                    //        callinst->getArgOperand(i)->getType()->print(rso_inner);
+                    //        result +=  rso_inner.str() + " | ";
+                    //    }
+                    //    funNameArray.push_back(result);
+                    // }
                 } else {
                     std::string type_str;
                     llvm::raw_string_ostream rso(type_str);
                     callinst->getType()->print(rso);
                     result += ":unnamed: | " + rso.str() + " | ";
-                    for (int i = 0; i < callinst->getNumArgOperands(); i++) {
+                    for (auto arg = callinst->arg_begin(); arg != callinst->arg_end(); ++arg) {
                         std::string type_str_inner;
                         llvm::raw_string_ostream rso_inner(type_str_inner);
-                        callinst->getArgOperand(i)->getType()->print(rso_inner);
+                        arg->get()->getType()->print(rso_inner);
                         result += rso_inner.str() + " | ";
                     }
+                    // for (int i = 0; i < callinst->getNumOperands(); i++) {
+
+                        // std::string type_str_inner;
+                        // llvm::raw_string_ostream rso_inner(type_str_inner);
+                        // callinst->getArgOperand(i)->getType()->print(rso_inner);
+                        // result += rso_inner.str() + " | ";
+                    // }
                     funNameArray.push_back(result);
                 }
             }
@@ -193,73 +217,98 @@ public:
         return true;
     }
 };
-
-struct MutatorPlugin : public ModulePass
-{
-    static char ID; // Pass identification, replacement for typeid
-    MutatorPlugin() : ModulePass(ID) {}
-
-    bool runOnModule(Module& M) override
-    {
-        auto& llvm_context = M.getContext();
-
-        // TODO read mutation patterns
-
-
-
-        std::mutex builderMutex;
-        std::mutex vectorMutex;
-        mutationLocationsstream.open(MutationLocationFile);
-        mutationLocationsstream << "[";
-        unsigned int concurrentThreadsSupported = ceil(std::thread::hardware_concurrency() * 30);
-        std::cout << "[INFO] number of threads: " << concurrentThreadsSupported << std::endl;
-
-        std::vector<std::vector<Function*>> threadFunctions(concurrentThreadsSupported);
-        auto i = 0;
-        for (Function& f : M.functions())
-        {
-            if (f.isDeclaration())
-            {
-                continue;
-            }
-
-            threadFunctions[i % concurrentThreadsSupported].push_back(&f);
-            ++i;
-        }
-        populatePatternVectors(CPP);
-        insertMutationApiFunctions(M, CPP);
-        number_functions = i;
-        std::vector<std::thread> threads;
-        for (auto& functions : threadFunctions)
-        {
-            threads.push_back(std::thread(&Worker::findPatternInFunctions, new Worker(M, builderMutex, vectorMutex), functions));
-        }
-
-        for (auto& thread : threads)
-        {
-            thread.join();
-        }
-        for (int vecSizeCounter = 0; vecSizeCounter < mutationLocationsvector.size(); vecSizeCounter++)
-        {
-            if (vecSizeCounter != 0) mutationLocationsstream << ",\n";
-            mutationLocationsstream << mutationLocationsvector[vecSizeCounter];
-        }
-        mutationLocationsstream << "]";
-        mutationLocationsstream.close();
-        std::ofstream graphStream;
-        graphStream.open(std::string(MutationLocationFile.c_str()) + ".graph");
-        graphStream << callgraph.dump(4);
-        graphStream.close();
-        return true;
-    }
-};
 }
 
-char MutatorPlugin::ID = 0;
-static RegisterPass<MutatorPlugin> X("mutationfinder", "Plugin to mutate a bitcode file.");
 
-static RegisterStandardPasses Y(
-        PassManagerBuilder::EP_OptimizerLast,
-        [](const PassManagerBuilder &Builder,
-           legacy::PassManagerBase &PM) { PM.add(new MutatorPlugin()); });
+struct MutatorPlugin : public llvm::PassInfoMixin<MutatorPlugin> {
+  // Without isRequired returning true, this pass will be skipped for functions
+  // decorated with the optnone LLVM attribute. Note that clang -O0 decorates
+  // all functions with optnone.
+  static bool isRequired() { return true; }
 
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+
+    std::cout << "MutationFinder Pass" << std::endl;
+
+    bool changed =  runOnModule(M);
+
+    return (changed ? llvm::PreservedAnalyses::none()
+                    : llvm::PreservedAnalyses::all());
+
+    // Here goes what you want to do with a pass
+
+    // Assuming you did not change anything of the IR code
+    return PreservedAnalyses::all();
+  }
+
+  bool runOnModule(Module &M) {
+    auto& llvm_context = M.getContext();
+
+    // TODO read mutation patterns
+
+    std::mutex builderMutex;
+    std::mutex vectorMutex;
+    mutationLocationsstream.open(MutationLocationFile);
+    mutationLocationsstream << "[";
+    unsigned int concurrentThreadsSupported = ceil(std::thread::hardware_concurrency() * 30);
+    // unsigned int concurrentThreadsSupported = 1;
+    std::cout << "[INFO] number of threads: " << concurrentThreadsSupported << std::endl;
+
+    std::vector<std::vector<Function*>> threadFunctions(concurrentThreadsSupported);
+    auto i = 0;
+    for (Function& f : M.functions())
+    {
+        if (f.isDeclaration())
+        {
+            continue;
+        }
+
+        threadFunctions[i % concurrentThreadsSupported].push_back(&f);
+        ++i;
+    }
+    populatePatternVectors(CPP);
+    insertMutationApiFunctions(M, CPP);
+    number_functions = i;
+    std::vector<std::thread> threads;
+    for (auto& functions : threadFunctions)
+    {
+        threads.push_back(std::thread(&Worker::findPatternInFunctions, new Worker(M, builderMutex, vectorMutex), functions));
+    }
+
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+    for (int vecSizeCounter = 0; vecSizeCounter < mutationLocationsvector.size(); vecSizeCounter++)
+    {
+        if (vecSizeCounter != 0) mutationLocationsstream << ",\n";
+        mutationLocationsstream << mutationLocationsvector[vecSizeCounter];
+    }
+    mutationLocationsstream << "]";
+    mutationLocationsstream.close();
+    std::ofstream graphStream;
+    graphStream.open(std::string(MutationLocationFile.c_str()) + ".graph");
+    graphStream << callgraph.dump(4);
+    graphStream.close();
+    return true;
+}
+};
+
+
+//-----------------------------------------------------------------------------
+// New PM Registration
+//-----------------------------------------------------------------------------
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "MutationFinder", "v0.1",
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [&](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+                    if(Name == "mutationfinder") {
+                        MPM.addPass(MutatorPlugin());
+                        return true;
+                    }
+                    return false;
+                });
+          }};
+}

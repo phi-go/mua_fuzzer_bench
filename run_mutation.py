@@ -9,12 +9,13 @@ import shlex
 
 
 def run(args):
-    print(args, flush=True)
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    output = str(proc.stdout)
+    print(shlex.join(args), flush=True)
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, errors='backslashreplace')
+    output = proc.stdout
+    print(type(output))
+    print(output)
     if proc.returncode != 0:
         raise ValueError(f"Run failed: {args}\n{output}")
-    print(output)
     return proc
 
 
@@ -34,7 +35,7 @@ def run_mutation(args):
     if prog.endswith(".bc"):
         # only run the pre computation algorithm if no mutation should be done
         if args.mutate == -2:
-            proc_res = run(["clang", "-S", "-emit-llvm", *bc_args, prog, "-o", f"{prog[:-3]}.ll"])
+            proc_res = run(["/usr/lib/llvm-15/bin/clang++", "-S", "-emit-llvm", *bc_args, prog, "-o", f"{prog[:-3]}.ll"])
         mutate = f"{prog[:-3]}.ll"
     else:
         mutate = prog

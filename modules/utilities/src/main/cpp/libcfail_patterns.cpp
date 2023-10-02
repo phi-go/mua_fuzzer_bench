@@ -82,102 +82,102 @@ INetAddrFailPattern::find(const Instruction *instr, int id, IRBuilder<> *builder
     return findConcreteFunction(instr, id, builder, builderMutex, M, "inet_addr", INET_ADDR_FAIL_WITHOUTCHECK);
 }
 
-std::vector<std::string>
-PrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
-    return findConcreteFunction(instr, id, builder, builderMutex, M, "printf", PRINTF);
-}
+// std::vector<std::string>
+// PrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
+//     return findConcreteFunction(instr, id, builder, builderMutex, M, "printf", PRINTF);
+// }
 
-bool PrintfPattern::mutate(
-        IRBuilder<>* builder,
-        IRBuilder<>* nextInstructionBuilder,
-        Instruction* instr,
-        std::mutex& builderMutex,
-        Module& M
-) {
-    auto* callInstr = dyn_cast<CallInst>(instr);
-    if (callInstr){
-        if (isMutationLocation(instr, &seglist, PRINTF)){
-            builderMutex.lock();
-            auto segref = seglist;
-            addMutationFoundSignal(builder, M, segref["UID"]);
-            std::vector<Value*> cfn_args;
-            for (int i =0; i<callInstr->getNumArgOperands(); i++){
-                cfn_args.push_back(callInstr->getArgOperand(i));
-            }
-            auto signalFunction = M.getFunction("mutate_printf_string");
-            callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
-            callInstr->removeFromParent();
-            builderMutex.unlock();
-            return true;
-        }
+// bool PrintfPattern::mutate(
+//         IRBuilder<>* builder,
+//         IRBuilder<>* nextInstructionBuilder,
+//         Instruction* instr,
+//         std::mutex& builderMutex,
+//         Module& M
+// ) {
+//     auto* callInstr = dyn_cast<CallInst>(instr);
+//     if (callInstr){
+//         if (isMutationLocation(instr, &seglist, PRINTF)){
+//             builderMutex.lock();
+//             auto segref = seglist;
+//             addMutationFoundSignal(builder, M, segref["UID"]);
+//             std::vector<Value*> cfn_args;
+//             for (int i =0; i<callInstr->getNumOperands(); i++){
+//                 cfn_args.push_back(callInstr->getArgOperand(i));
+//             }
+//             auto signalFunction = M.getFunction("mutate_printf_string");
+//             callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
+//             callInstr->removeFromParent();
+//             builderMutex.unlock();
+//             return true;
+//         }
 
-    }
-    return false;
-}
+//     }
+//     return false;
+// }
 
-std::vector<std::string>
-SPrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
-    return findConcreteFunction(instr, id, builder, builderMutex, M, "sprintf", SPRINTF);
-}
+// std::vector<std::string>
+// SPrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
+//     return findConcreteFunction(instr, id, builder, builderMutex, M, "sprintf", SPRINTF);
+// }
 
-bool SPrintfPattern::mutate(
-        IRBuilder<>* builder,
-        IRBuilder<>* nextInstructionBuilder,
-        Instruction* instr,
-        std::mutex& builderMutex,
-        Module& M
-) {
-    auto* callInstr = dyn_cast<CallInst>(instr);
-    if (callInstr){
-        if (isMutationLocation(instr, &seglist, SPRINTF)){
-            builderMutex.lock();
-            auto segref = seglist;
-            addMutationFoundSignal(builder, M, segref["UID"]);
-            std::vector<Value*> cfn_args;
-            for (int i =0; i<callInstr->getNumArgOperands(); i++){
-                cfn_args.push_back(callInstr->getArgOperand(i));
-            }
-            auto signalFunction = M.getFunction("mutate_sprintf_string");
-            callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
-            callInstr->removeFromParent();
-            builderMutex.unlock();
-            return true;
-        }
+// bool SPrintfPattern::mutate(
+//         IRBuilder<>* builder,
+//         IRBuilder<>* nextInstructionBuilder,
+//         Instruction* instr,
+//         std::mutex& builderMutex,
+//         Module& M
+// ) {
+//     auto* callInstr = dyn_cast<CallInst>(instr);
+//     if (callInstr){
+//         if (isMutationLocation(instr, &seglist, SPRINTF)){
+//             builderMutex.lock();
+//             auto segref = seglist;
+//             addMutationFoundSignal(builder, M, segref["UID"]);
+//             std::vector<Value*> cfn_args;
+//             for (int i =0; i<callInstr->getNumOperands(); i++){
+//                 cfn_args.push_back(callInstr->getArgOperand(i));
+//             }
+//             auto signalFunction = M.getFunction("mutate_sprintf_string");
+//             callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
+//             callInstr->removeFromParent();
+//             builderMutex.unlock();
+//             return true;
+//         }
 
-    }
-    return false;
-}
+//     }
+//     return false;
+// }
 
 
-std::vector<std::string>
-SNPrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
-    return findConcreteFunction(instr, id, builder, builderMutex, M, "snprintf", SNPRINTF);
-}
+// std::vector<std::string>
+// SNPrintfPattern::find(const Instruction *instr, int id, IRBuilder<> *builder, std::mutex &builderMutex, Module &M) {
+//     return findConcreteFunction(instr, id, builder, builderMutex, M, "snprintf", SNPRINTF);
+// }
 
-bool SNPrintfPattern::mutate(
-        IRBuilder<>* builder,
-        IRBuilder<>* nextInstructionBuilder,
-        Instruction* instr,
-        std::mutex& builderMutex,
-        Module& M
-) {
-    auto* callInstr = dyn_cast<CallInst>(instr);
-    if (callInstr){
-        if (isMutationLocation(instr, &seglist, SNPRINTF)){
-            builderMutex.lock();
-            auto segref = seglist;
-            addMutationFoundSignal(builder, M, segref["UID"]);
-            std::vector<Value*> cfn_args;
-            for (int i =0; i<callInstr->getNumArgOperands(); i++){
-                cfn_args.push_back(callInstr->getArgOperand(i));
-            }
-            auto signalFunction = M.getFunction("mutate_snprintf_string");
-            callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
-            callInstr->removeFromParent();
-            builderMutex.unlock();
-            return true;
-        }
+// bool SNPrintfPattern::mutate(
+//         IRBuilder<>* builder,
+//         IRBuilder<>* nextInstructionBuilder,
+//         Instruction* instr,
+//         std::mutex& builderMutex,
+//         Module& M
+// ) {
+    // auto* callInstr = dyn_cast<CallInst>(instr);
+    // if (callInstr){
+    //     if (isMutationLocation(instr, &seglist, SNPRINTF)){
+    //         builderMutex.lock();
+    //         auto segref = seglist;
+    //         addMutationFoundSignal(builder, M, segref["UID"]);
+    //         std::vector<Value*> cfn_args;
+    //         for (int i =0; i<callInstr->getNumOperands(); i++){
+    //             cfn_args.push_back(callInstr->getArgOperand(i));
+    //         }
+    //         auto signalFunction = M.getFunction("mutate_snprintf_string");
+    //         callInstr->replaceAllUsesWith(builder->CreateCall(signalFunction, cfn_args));
+    //         callInstr->removeFromParent();
+    //         builderMutex.unlock();
+    //         return true;
+    //     }
 
-    }
-    return false;
-}
+    // }
+//     return false;
+// }

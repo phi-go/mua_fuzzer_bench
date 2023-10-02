@@ -11,9 +11,9 @@ void populateCallInstPatterns(bool cpp){
     CallInstPatterns.push_back(std::make_unique <CallocPattern>());
     CallInstPatterns.push_back(std::make_unique <FGetsPattern>());
     CallInstPatterns.push_back(std::make_unique <INetAddrFailPattern>());
-    CallInstPatterns.push_back(std::make_unique <PrintfPattern>());
-    CallInstPatterns.push_back(std::make_unique <SPrintfPattern>());
-    CallInstPatterns.push_back(std::make_unique <SNPrintfPattern>());
+    // CallInstPatterns.push_back(std::make_unique <PrintfPattern>());
+    // CallInstPatterns.push_back(std::make_unique <SPrintfPattern>());
+    // CallInstPatterns.push_back(std::make_unique <SNPrintfPattern>());
     CallInstPatterns.push_back(std::make_unique <DeleteCallInstructionPattern>());
     if (cpp){
         CallInstPatterns.push_back(std::make_unique <NewArrayPattern>());
@@ -147,15 +147,15 @@ void populatePattern(json* pattern) {
         case COMPARE_EQUAL_TO:
             MiscInstPatterns.push_back(std::make_unique<CompareEqualToPattern>(pattern));
             break;
-        case PRINTF:
-            CallInstPatterns.push_back(std::make_unique<PrintfPattern>(pattern));
-            break;
-        case SPRINTF:
-            CallInstPatterns.push_back(std::make_unique<SPrintfPattern>(pattern));
-            break;
-        case SNPRINTF:
-            CallInstPatterns.push_back(std::make_unique<SNPrintfPattern>(pattern));
-            break;
+        // case PRINTF:
+        //     CallInstPatterns.push_back(std::make_unique<PrintfPattern>(pattern));
+        //     break;
+        // case SPRINTF:
+        //     CallInstPatterns.push_back(std::make_unique<SPrintfPattern>(pattern));
+        //     break;
+        // case SNPRINTF:
+        //     CallInstPatterns.push_back(std::make_unique<SNPrintfPattern>(pattern));
+        //     break;
         case NEW_ARRAY:
             CallInstPatterns.push_back(std::make_unique<NewArrayPattern>(pattern));
             break;

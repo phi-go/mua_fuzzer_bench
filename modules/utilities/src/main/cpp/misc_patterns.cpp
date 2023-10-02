@@ -157,6 +157,8 @@ bool ATOMICRMWPattern::convertAtomicBinOpToBinOp(AtomicRMWInst* instr, json *seg
         case AtomicRMWInst::Min:
         case AtomicRMWInst::UMax:
         case AtomicRMWInst::UMin:
+        case AtomicRMWInst::FMax:
+        case AtomicRMWInst::FMin:
             return false; // TODO in future we can populate this as well
         case AtomicRMWInst::Add:
         {
@@ -201,7 +203,8 @@ bool ATOMICRMWPattern::convertAtomicBinOpToBinOp(AtomicRMWInst* instr, json *seg
     // old atomic version
     auto segref = *seglist;
     addMutationFoundSignal(nextInstructionBuilder, M, segref["UID"]);
-    auto loadResult = nextInstructionBuilder->CreateLoad(instr->getOperand(0));
+    auto loadResult = nextInstructionBuilder->CreateLoad(
+        instr->getOperand(0)->getType(), instr->getOperand(0));
     auto newinst = nextInstructionBuilder->CreateBinOp(
             operand,
             loadResult,

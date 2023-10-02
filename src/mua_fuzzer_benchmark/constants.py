@@ -57,6 +57,10 @@ IN_DOCKER_WORKDIR = "/workdir/"
 TRIGGERED_STR = "Triggered!\r\n"
 
 MAX_RUN_EXEC_IN_CONTAINER_TIME = 60*15
+MAX_RUN_LOCAL_TIME = 60
+
+LOCAL_ROOT_DIR = Path(__file__).parent.parent.parent.absolute()
+LOCAL_LIB_DIR = LOCAL_ROOT_DIR/"build/install/LLVM_Mutation_Tool/lib"
 
 SHARED_DIR = Path(os.getenv("MUT_SHARED_DIR", "/dev/shm/mua_fuzzer_benchmark/")).absolute()
 TMP_PROG_DIR = HOST_TMP_PATH/"programs"

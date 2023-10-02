@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, is_dataclass, asdict
 import pprint
 import sys
 import os
@@ -26,14 +26,24 @@ from pathlib import Path
 import docker
 
 import logging
-from data_types import ActiveMutants, CheckResultCovered, CheckResultKilled, CheckResultOrigCrash, CheckResultOrigTimeout, CheckResultTimeout, CheckRun, CommonRun, CompileArg, CoveredResult, CrashCheckResult,  FuzzerRun, GatherSeedRun, GatheredSeedsRun, KCovResult, KCovRun, MinimizeSeedRun, Mutation, MutationRun, MutationType, Program, RerunMutations, ResultingRun, RunResult, RunResultKey, SeedRun, SeedRunResult, SuperMutant, SuperMutantUninitialized, check_results_union
+from data_types import ActiveMutants, CheckResultCovered, CheckResultKilled, CheckResultOrigCrash, CheckResultOrigTimeout, CheckResultTimeout, CheckRun, CommonRun, CompileArg, CoveredResult, CrashCheckResult,  FuzzerRun, GatherSeedRun, GatheredSeedsRun, KCovResult, KCovRun, MinimizeSeedRun, Mutation, MutationRun, MutationType, Program, RerunMutations, ResultingRun, RunResult, RunResultKey, SeedRun, SeedRunResult, SuperMutant, SuperMutantUninitialized, LocalProgramConfig, check_results_union
 from docker_interaction import DockerLogStreamer, run_exec_in_container, start_mutation_container, start_testing_container, Container
 
-from constants import EXEC_ID, MAX_RETRY_COUNT, MUT_BC_SUFFIX, MUT_LL_SUFFIX, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUTATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
+from constants import EXEC_ID, LOCAL_LIB_DIR, MAX_RETRY_COUNT, MUT_BC_SUFFIX, MUT_LL_SUFFIX, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUTATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
     JUST_SEEDS, STOP_ON_MULTI, SKIP_LOCATOR_SEED_CHECK, CHECK_INTERVAL, \
-    HOST_TMP_PATH, UNSOLVED_MUTANTS_DIR, IN_DOCKER_WORKDIR, SHARED_DIR, IN_DOCKER_SHARED_DIR
+    HOST_TMP_PATH, UNSOLVED_MUTANTS_DIR, IN_DOCKER_WORKDIR, SHARED_DIR, IN_DOCKER_SHARED_DIR, LOCAL_ROOT_DIR
 from helpers import CoveredFile, fuzzer_container_tag, get_seed_dir, hash_file, load_fuzzers, load_programs, mutation_detector_path, mutation_locations_path, mutation_prog_source_path, shared_dir_to_docker, subject_container_tag
 from db import ReadStatsDb, Stats
+
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, o): # type: ignore
+        if is_dataclass(o): # type: ignore[misc]
+            return asdict(o) # type: ignore[misc]
+        if isinstance(o, Path):
+            return str(o)
+        return super().default(o)
+
 
 class RerunMutationsDict(TypedDict):
     prog: str
@@ -596,6 +606,13 @@ def resolve_compile_args(args: List[CompileArg], workdir: str) -> List[str]:
         else:
             raise ValueError("Unknown action: {}", arg)
     return resolved
+
+
+def prepend_main_arg_local(args: List[CompileArg]) -> List[CompileArg]:
+    return [
+        CompileArg(val="dockerfiles/programs/common/main.cc", action='prefix_workdir'),
+        *args
+    ]
 
 
 def prepend_main_arg(args: List[CompileArg]) -> List[CompileArg]:
@@ -2956,6 +2973,210 @@ def locator_mutants(
     shutil.copy(tmp_db_path, result_path)
 
 
+def load_local_config(config_path_s: str) -> List[LocalProgramConfig]:
+    config_path = Path(config_path_s)
+    assert config_path.is_file(), f"Config path {config_path} does not exist or is not a file."
+
+    config = []
+    with open(config_path, "rt") as f:
+        data_raw = json.load(f) # type: ignore[misc]
+        for prog, prog_data in data_raw.items(): # type: ignore[misc]
+            config.append(LocalProgramConfig(
+                name=prog, # type: ignore[misc]
+                bc_compile_args=prog_data['bc_compile_args'], # type: ignore[misc]
+                bin_compile_args=prog_data['bin_compile_args'], # type: ignore[misc]
+                is_cpp=prog_data['is_cpp'], # type: ignore[misc]
+                orig_bc=Path(prog_data['orig_bc']).absolute(), # type: ignore[misc]
+                omit_functions=prog_data['omit_functions'], # type: ignore[misc]
+            ))
+    return config
+
+
+def run_exec_local(
+        raise_on_error: bool,
+        cmd: List[str],
+        timeout: Optional[int] = None
+) -> Dict[str, Union[int, str, bool]]:
+    """
+    Run command locally.
+    If return_code is not 0, raise a ValueError containing the run result.
+    """
+    timed_out = False
+    # cmd: List[str] = ["docker", "exec", *(exec_args if exec_args is not None else []), container_name, *cmd]
+    with subprocess.Popen(cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        close_fds=True,
+        errors='backslashreplace',  # text mode: stdout is a str
+        # preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ) as proc:
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate(timeout=10)
+            timed_out = True
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
+
+        returncode = proc.poll()
+        print(returncode, stdout)
+
+        assert isinstance(returncode, int)
+        if raise_on_error and returncode != 0:
+            logger.debug(f"process error (timed out): {str(proc.args)}\n{stdout}")
+            raise ValueError(f"exec_in_docker failed (timed out)\nexec_code: {returncode}\n{stdout}")
+
+        return {'returncode': returncode, 'out': stdout, 'timed_out': timed_out}
+
+
+def instrument_prog_local(prog_config: LocalProgramConfig) -> Dict[str, Union[int, str, bool]]:
+    # Compile the mutation location detector for the prog.
+    args = ["./run_mutation.py",
+            "-bc", str(prog_config.orig_bc),
+            *(["-cpp"] if prog_config.is_cpp else ['-cc']),  # specify compiler
+            "--bc-args=" + build_compile_args(
+                prog_config.bc_compile_args, str(LOCAL_ROOT_DIR)),
+            "--bin-args=" + build_compile_args(
+                prepend_main_arg_local(prog_config.bin_compile_args), str(LOCAL_ROOT_DIR))]
+    try:
+        return run_exec_local(True, args)
+    except Exception as e:
+        logger.warning(f"Exception during instrumenting {e}")
+        raise e
+
+
+def get_mutation_locator_and_data_local(
+    stats: Stats,
+    progs: List[LocalProgramConfig],
+) -> List[Tuple[str, Path, Path]]:
+    "Get the mutation locator executable and the data for all mutations."
+
+    progs_locator: List[Tuple[str, Path, Path]] = []
+
+    for prog_config in progs:
+        start = time.time()
+        logger.info("="*50)
+        logger.info(f"Compiling base and locating mutations for {prog_config.name}")
+
+        instrument_result = instrument_prog_local(prog_config)
+
+        # # get info on mutations
+        # with open(mutation_locations_path(prog_info), 'rt') as f:
+        #     mutation_data: List[Dict[str, str]] = json.load(f)
+
+        # mutations = list(new_mutation(int(p['UID']), p, prog_info) for p in mutation_data)
+
+        # # Remove mutations for functions that should not be mutated
+        # omit_functions = prog_info.omit_functions
+        # mutations = [mm for mm in mutations if mm.funname not in omit_functions]
+
+        # bc_path = Path(prog_info.orig_bc)
+        # detector_path = mutation_detector_path(prog_info)
+
+        # stats.new_prog(EXEC_ID, prog, prog_info)
+
+        # logger.info(f"Found {len(mutations)} mutations for {prog}")
+        # for mut in mutations:
+        #     stats.new_mutation(EXEC_ID, mut)
+
+        # progs_locator.append((prog, bc_path, detector_path))
+
+    return progs_locator
+
+
+def locator_local(
+    config_path_s: str,
+    result_path_s: str,
+) -> None:
+    result_path = Path(result_path_s).absolute()
+    assert not result_path.exists(), f"Result path {result_path} already exists."
+
+    config = load_local_config(config_path_s)
+    assert len(config) > 0, "No programs found in config."
+    for prog_config in config:
+        assert prog_config.orig_bc.is_file(), f"Orig bc {prog_config.orig_bc} is not a file."
+
+    # change workdir to that of the script
+    os.chdir(LOCAL_ROOT_DIR)
+
+    # prepare_mutator_docker_image(fresh_images)
+    prepare_shared_and_tmp_dir_local()
+
+    # run ldconfig to make sure our mutator lib is found
+    run_exec_local(True, ["ldconfig", "-n", str(LOCAL_LIB_DIR)])
+
+    execution_start_time = time.time()
+
+    # prepare environment
+    base_shm_dir = SHARED_DIR/"mua_locator"
+    base_shm_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize the stats object
+    tmp_db_path = base_shm_dir/"stats.db"
+    stats = Stats(str(tmp_db_path))
+
+    # Record current eval execution data
+    # Get the current git status
+    logger.warning("WARNING: git status is not recorded for local locator runs.")
+    # git_status = get_git_status()
+    git_status = "local"
+    stats.new_execution(
+        EXEC_ID, platform.uname()[1], git_status, None, execution_start_time,
+        json.dumps({ # type: ignore[misc]
+                'config': config,
+            },
+            cls=CustomJSONEncoder # type: ignore[misc]
+        ),
+        json.dumps({k: v for k, v in os.environ.items()}) # type: ignore[misc]
+    )
+
+    class MutationDocEntry(TypedDict):
+        pattern_name: str
+        typeID: int
+        pattern_location: str
+        pattern_class: str
+        description: str
+        procedure: str
+
+    # Get a record of all mutation types.
+    with open("mutation_doc.json", "rt") as f:
+        mutation_types: List[MutationDocEntry] = json.load(f)
+        for mt in mutation_types:
+            mutation_type = MutationType(
+                pattern_name=mt['pattern_name'],
+                type_id=mt['typeID'],
+                pattern_location=mt['pattern_location'],
+                pattern_class=mt['pattern_class'],
+                description=mt['description'],
+                procedure=mt['procedure'],
+            )
+            stats.new_mutation_type(mutation_type)
+
+    locators = get_mutation_locator_and_data_local(stats, config)
+
+    # for prog, bc_path, locator in locators:
+    #     result_prog_path = result_path/"progs"/f"{prog}"
+    #     result_prog_path.mkdir(parents=True, exist_ok=False)
+    #     result_locator_path = result_prog_path/"locator"
+    #     shutil.copy(locator, result_locator_path)
+    #     result_bc_path = result_prog_path/"bc"
+    #     shutil.copy(bc_path, result_bc_path)
+    #     print(f"bc and locator for {prog} copied to {result_locator_path}")
+
+    # shutil.copytree(HOST_TMP_PATH/"lib", result_path/"lib")
+    # print(f"lib copied to {result_path/'lib'}")
+
+    # # Record total time for this execution.
+    # stats.execution_done(EXEC_ID, time.time() - execution_start_time)
+
+    # result_path.mkdir(parents=True, exist_ok=True)
+    # # Copy the stats db to the result path
+    # result_db_path = result_path.joinpath("stats.db")
+    # shutil.copy(tmp_db_path, result_db_path)
+
+
 def get_seed_gathering_runs(
     fuzzers: List[str],
     progs: List[str],
@@ -3854,12 +4075,7 @@ def prepare_mutator_docker_image(fresh_images: bool) -> None:
     # print_pass("Successfully built Mutator Docker container.")
 
 
-def prepare_shared_dir_and_tmp_dir() -> None:
-    """
-    Prepare the shared dir and ./tmp dir for the evaluation containers.
-    The shared dir will be deleted if it already exists.
-    """
-
+def prepare_shared_and_tmp_dir_local() -> None:
     # SHARED_DIR
     if SHARED_DIR.exists():
         if SHARED_DIR.is_dir():
@@ -3887,7 +4103,15 @@ def prepare_shared_dir_and_tmp_dir() -> None:
                 raise Exception(f"The specified location for tmp dir is a file: {tmp_dir}.")
 
         tmp_dir.mkdir(parents=True)
+
+
+def prepare_shared_dir_and_tmp_dir() -> None:
+    """
+    Prepare the shared dir and ./tmp dir for the evaluation containers.
+    The shared dir will be deleted if it already exists.
+    """
     
+    prepare_shared_and_tmp_dir_local()
 
     proc = subprocess.run(f"""
         docker rm dummy || true
@@ -4126,6 +4350,19 @@ def main() -> None:
              '{["prog": "<prog>", "ids": [1, 2, 3], "mode": "single"}]')
     del subparser
 
+    # CMD: locator_local 
+    subparser = subparsers.add_parser('locator_local',
+        help="Run the `locator` command without using docker containers.")
+    subparser.add_argument("--result-path", required=True,
+        help='The path where the result database should be written to. The path '
+         'will checked to not exist. The extension will be overwritten with ".db". '
+         'Note that the database will only be copied to this location once the '
+         'evaluation finishes.')
+    subparser.add_argument("--config-path", required=True,
+        help="Path to the configuration file, see `dockerfiles/programs/*/config.json` for examples, "
+            "describing the the compilation.")
+    del subparser
+
     args = parser.parse_args()
 
     cmd = args.cmd
@@ -4151,6 +4388,8 @@ def main() -> None:
         locator(args.progs, args.fresh_images, args.result_path)
     elif cmd == 'locator_mutants':
         locator_mutants(args.statsdb, args.mutation_list, args.result_path)
+    elif cmd == 'locator_local':
+        locator_local(args.config_path, args.result_path)
     else:
         parser.print_help(sys.stderr)
 
@@ -4160,5 +4399,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         logger.error(e, exc_info=True)
-        raise e
+        exit(1)
 
