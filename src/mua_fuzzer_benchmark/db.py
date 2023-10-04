@@ -5,7 +5,7 @@ import time
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Set, Tuple, TypeVar, ParamSpec, Concatenate, TYPE_CHECKING, cast
-from data_types import CheckResultKilled, CheckResultTimeout, DoneMutation, InitialSuperMutant, Program, MutationType, Mutation, MutationRun, SuperMutant, FuzzerRun, CoveredResult
+from data_types import CheckResultKilled, CheckResultTimeout, DoneMutation, InitialSuperMutant, LocalProgramConfig, MutationLocal, Program, MutationType, Mutation, MutationRun, SuperMutant, FuzzerRun, CoveredResult
 
 from constants import WITH_ASAN, WITH_MSAN
 from helpers import mutation_locations_path, mutation_prog_source_path
@@ -410,7 +410,7 @@ class Stats:
         self.conn.commit()
 
     @connection
-    def new_mutation(self, c: sqlite3.Cursor, exec_id: str, data: Mutation) -> None:
+    def new_mutation(self, c: sqlite3.Cursor, exec_id: str, data: Mutation | MutationLocal) -> None:
         assert self.conn is not None, "connection wrapper returns early if conn is None"
 
         c.execute('INSERT INTO mutations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -431,7 +431,7 @@ class Stats:
         self.conn.commit()
 
     @connection
-    def new_prog(self, c: sqlite3.Cursor, exec_id: str, prog: str, data: Program) -> None:
+    def new_prog(self, c: sqlite3.Cursor, exec_id: str, prog: str, data: Program | LocalProgramConfig) -> None:
         assert self.conn is not None, "connection wrapper returns early if conn is None"
         with open(data.orig_bc, 'rb') as f:
             bc_file_data = f.read()
@@ -439,14 +439,22 @@ class Stats:
             prog_source_data = f.read()
         with open(mutation_locations_path(data), 'rt') as f:
             ml_data = f.read()
+
+        if isinstance(data, Program):
+            dict_path = str(data.dict_path)
+            orig_bin = str(data.orig_bin)
+        else:
+            dict_path = None
+            orig_bin = None
+
         c.execute('INSERT INTO progs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 exec_id,
                 prog,
                 json.dumps(data.bc_compile_args, default=lambda o: o.__dict__), # type: ignore[misc]
                 json.dumps(data.bin_compile_args, default=lambda o: o.__dict__), # type: ignore[misc]
-                str(data.dict_path),
-                str(data.orig_bin),
+                dict_path,
+                orig_bin,
                 bc_file_data,
                 prog_source_data,
                 ml_data,

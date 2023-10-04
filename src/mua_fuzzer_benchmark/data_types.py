@@ -568,3 +568,17 @@ class LocalProgramConfig:
     is_cpp: bool
     orig_bc: Path
     omit_functions: List[str]
+
+
+@dataclass
+class MutationLocal:
+    mutation_id: int
+    prog: LocalProgramConfig
+    type_id: str
+    directory: str
+    filePath: str
+    line: int
+    column: int
+    instr: str
+    funname: str
+    additional_info: str

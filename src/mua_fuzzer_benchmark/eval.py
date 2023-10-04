@@ -26,7 +26,7 @@ from pathlib import Path
 import docker
 
 import logging
-from data_types import ActiveMutants, CheckResultCovered, CheckResultKilled, CheckResultOrigCrash, CheckResultOrigTimeout, CheckResultTimeout, CheckRun, CommonRun, CompileArg, CoveredResult, CrashCheckResult,  FuzzerRun, GatherSeedRun, GatheredSeedsRun, KCovResult, KCovRun, MinimizeSeedRun, Mutation, MutationRun, MutationType, Program, RerunMutations, ResultingRun, RunResult, RunResultKey, SeedRun, SeedRunResult, SuperMutant, SuperMutantUninitialized, LocalProgramConfig, check_results_union
+from data_types import ActiveMutants, CheckResultCovered, CheckResultKilled, CheckResultOrigCrash, CheckResultOrigTimeout, CheckResultTimeout, CheckRun, CommonRun, CompileArg, CoveredResult, CrashCheckResult,  FuzzerRun, GatherSeedRun, GatheredSeedsRun, KCovResult, KCovRun, MinimizeSeedRun, Mutation, MutationLocal, MutationRun, MutationType, Program, RerunMutations, ResultingRun, RunResult, RunResultKey, SeedRun, SeedRunResult, SuperMutant, SuperMutantUninitialized, LocalProgramConfig, check_results_union
 from docker_interaction import DockerLogStreamer, run_exec_in_container, start_mutation_container, start_testing_container, Container
 
 from constants import EXEC_ID, LOCAL_LIB_DIR, MAX_RETRY_COUNT, MUT_BC_SUFFIX, MUT_LL_SUFFIX, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUTATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
@@ -2974,6 +2974,13 @@ def locator_mutants(
 
 
 def load_local_config(config_path_s: str) -> List[LocalProgramConfig]:
+    def load_compile_arg(elem: Any) -> CompileArg:  # type: ignore[misc]
+        assert isinstance(elem, dict), f"Expected dict, with keys 'val' and 'action', got {type(elem)}"  # type: ignore[misc]
+        assert 'val' in elem.keys(), f"Expected dict, with keys 'val' and 'action', got {elem.keys()}"
+        assert 'action' in elem.keys(), f"Expected dict, with keys 'val' and 'action', got {elem.keys()}"
+        return CompileArg(elem['val'], elem['action'])
+
+
     config_path = Path(config_path_s)
     assert config_path.is_file(), f"Config path {config_path} does not exist or is not a file."
 
@@ -2983,8 +2990,8 @@ def load_local_config(config_path_s: str) -> List[LocalProgramConfig]:
         for prog, prog_data in data_raw.items(): # type: ignore[misc]
             config.append(LocalProgramConfig(
                 name=prog, # type: ignore[misc]
-                bc_compile_args=prog_data['bc_compile_args'], # type: ignore[misc]
-                bin_compile_args=prog_data['bin_compile_args'], # type: ignore[misc]
+                bc_compile_args=[load_compile_arg(aa) for aa in prog_data['bc_compile_args']], # type: ignore[misc]
+                bin_compile_args=[load_compile_arg(aa) for aa in prog_data['bin_compile_args']], # type: ignore[misc]
                 is_cpp=prog_data['is_cpp'], # type: ignore[misc]
                 orig_bc=Path(prog_data['orig_bc']).absolute(), # type: ignore[misc]
                 omit_functions=prog_data['omit_functions'], # type: ignore[misc]
@@ -3039,12 +3046,31 @@ def instrument_prog_local(prog_config: LocalProgramConfig) -> Dict[str, Union[in
             "--bc-args=" + build_compile_args(
                 prog_config.bc_compile_args, str(LOCAL_ROOT_DIR)),
             "--bin-args=" + build_compile_args(
-                prepend_main_arg_local(prog_config.bin_compile_args), str(LOCAL_ROOT_DIR))]
+                prog_config.bin_compile_args, str(LOCAL_ROOT_DIR))]
     try:
         return run_exec_local(True, args)
     except Exception as e:
         logger.warning(f"Exception during instrumenting {e}")
         raise e
+
+
+# def new_mutation_local(
+#     mutation_id: int,
+#     mutation_data: Dict[str, str],
+#     prog: LocalProgramConfig
+# ) -> MutationLocal:
+#     return MutationLocal(
+#         mutation_id=int(mutation_id),
+#         prog=prog,
+#         type_id=mutation_data.pop('type'),
+#         directory=mutation_data.pop('directory'),
+#         filePath=mutation_data.pop('filePath'),
+#         line=int(mutation_data.pop('line')),
+#         column=int(mutation_data.pop('column')),
+#         instr=mutation_data.pop('instr'),
+#         funname=mutation_data.pop('funname'),
+#         additional_info=json.dumps(mutation_data)  # might not all be str
+#     )
 
 
 def get_mutation_locator_and_data_local(
@@ -3063,19 +3089,19 @@ def get_mutation_locator_and_data_local(
         instrument_result = instrument_prog_local(prog_config)
 
         # # get info on mutations
-        # with open(mutation_locations_path(prog_info), 'rt') as f:
+        # with open(mutation_locations_path(prog_config), 'rt') as f:
         #     mutation_data: List[Dict[str, str]] = json.load(f)
 
-        # mutations = list(new_mutation(int(p['UID']), p, prog_info) for p in mutation_data)
+        # mutations = list(new_mutation_local(int(p['UID']), p, prog_config) for p in mutation_data)
 
         # # Remove mutations for functions that should not be mutated
-        # omit_functions = prog_info.omit_functions
+        # omit_functions = prog_config.omit_functions
         # mutations = [mm for mm in mutations if mm.funname not in omit_functions]
 
-        # bc_path = Path(prog_info.orig_bc)
-        # detector_path = mutation_detector_path(prog_info)
+        # bc_path = Path(prog_config.orig_bc)
+        # detector_path = mutation_detector_path(prog_config)
 
-        # stats.new_prog(EXEC_ID, prog, prog_info)
+        # stats.new_prog(EXEC_ID, prog_config.name, prog_config)
 
         # logger.info(f"Found {len(mutations)} mutations for {prog}")
         # for mut in mutations:
@@ -3104,8 +3130,8 @@ def locator_local(
     # prepare_mutator_docker_image(fresh_images)
     prepare_shared_and_tmp_dir_local()
 
-    # run ldconfig to make sure our mutator lib is found
-    run_exec_local(True, ["ldconfig", "-n", str(LOCAL_LIB_DIR)])
+    # # run ldconfig to make sure our mutator lib is found
+    # run_exec_local(True, ["ldconfig", "-n", str(LOCAL_LIB_DIR)])
 
     execution_start_time = time.time()
 

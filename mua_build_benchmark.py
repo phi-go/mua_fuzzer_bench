@@ -19,8 +19,29 @@ def extract_bc(executable_path: Path):
          errors='backslashreplace')
 
     return bc_path
-    
-    
+
+
+def extract_args(args):
+    kept_args = []
+
+    for arg in args:
+        if not arg.startswith('-'):
+            continue
+
+        if any(arg.startswith(ss) for ss in [
+            "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib"
+        ]):
+            kept_args.append({'val': arg, 'action': None})
+
+        elif any(arg.startswith(ss) for ss in [
+            "-O", "-o", "-fprofile-instr-generate", "-fcoverage-mapping",
+        ]):
+            continue
+
+        else:
+            raise Exception(f"Unknown arg type: {arg} in {args}")
+
+    return kept_args
 
 
 def main():
@@ -58,27 +79,27 @@ def main():
     cmds = []
     with sqlite3.connect(recording_db) as conn:
         c = conn.cursor()
-        c.execute("SELECT time, cmd FROM cmds")
+        c.execute("SELECT time, cmd, env FROM cmds")
         for row in c:
             cmds.append(row)
 
     executables = []
-    for _, cmd_str in cmds:
+    for _time, cmd_str, env_str in cmds:
             cmd = json.loads(cmd_str)
+            env = json.loads(env_str)
             if  FUZZER_LIB_STR in cmd:
                 o_args_idx = cmd.index('-o')
                 executable_path = Path(cmd[o_args_idx + 1])
                 print(f"Found candidate executable: {executable_path}")
                 bc_path = extract_bc(executable_path)
                 print(f"Extracted bitcode to {bc_path}")
-                executables.append((cmd, bc_path))
+                executables.append((cmd, env, bc_path))
 
     assert len(executables) > 0, "No bitcode files found!"
 
     # Create config for each executable bc
     config = {}
-    for cmd, bc_path in executables:
-        print(cmd, bc_path)
+    for cmd, _env, bc_path in executables:
         exec_name = Path(bc_path).stem
 
         is_cpp = None
@@ -89,11 +110,11 @@ def main():
         else:
             raise Exception(f"Unknown executable: {cmd[0]}")
 
+        bin_compile_args = extract_args(cmd)
+
         exec_config = {
             "bc_compile_args": [],
-            "bin_compile_args": [
-                # "-I/usr/lib/llvm-15/include", "-D_GNU_SOURCE", "-D__STDC_CONSTANT_MACROS", "-D__STDC_FORMAT_MACROS", "-D__STDC_LIMIT_MACROS", "-Wl,--no-as-needed", "-Wl,-ldl", "-Wl,-lm", "-stdlib=libc++"
-                ],
+            "bin_compile_args": bin_compile_args,
             "is_cpp": is_cpp,
             "dict": None,
             "orig_bc": str(bc_path.absolute()),

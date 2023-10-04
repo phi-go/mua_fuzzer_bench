@@ -90,7 +90,7 @@ def compile_and_find(args):
         # *bc_args,
         *bin_args,
         f"-L{dynamic_libraries_folder}", # points the runtime linker to the location of the included shared library
-        "-lm", "-lz", "-ldl", # some often used libraries
+        # "-lm", "-lz", "-ldl", # some often used libraries
         f"-l{linked_libraries}", # the library containing all the api functions that were called by mutations
         "-o", f"{progsource}.opt_mutate", # output file
     ]

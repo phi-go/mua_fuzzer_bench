@@ -6,7 +6,7 @@ import shutil
 import time
 from typing import Dict, List, Optional, TypedDict
 
-from data_types import CompileArg, Fuzzer, Program
+from data_types import CompileArg, Fuzzer, LocalProgramConfig, Program
 
 from constants import BLOCK_SIZE, IN_DOCKER_SHARED_DIR, SHARED_DIR
 
@@ -21,7 +21,7 @@ def subject_container_tag(name: str) -> str:
     return f"mutation-testing-subject-{name}"
 
 
-def mutation_locations_path(prog_info: Program) -> Path:
+def mutation_locations_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
     return orig_bc.with_suffix('.ll.mutationlocations')
 
@@ -31,12 +31,12 @@ def mutation_locations_graph_path(prog_info: Program) -> Path:
     return orig_bc.with_suffix('.ll.mutationlocations.graph')
 
 
-def mutation_detector_path(prog_info: Program) -> Path:
+def mutation_detector_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
     return  orig_bc.with_suffix(".ll.opt_mutate")
 
 
-def mutation_prog_source_path(prog_info: Program) -> Path:
+def mutation_prog_source_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
     return orig_bc.with_suffix('.ll.ll')
 
