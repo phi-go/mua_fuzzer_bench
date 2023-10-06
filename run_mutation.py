@@ -10,13 +10,12 @@ import shlex
 
 def run(args):
     print(shlex.join(args), flush=True)
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, errors='backslashreplace')
-    output = proc.stdout
-    print(type(output))
+    try:
+        output = subprocess.check_output(args, stderr=subprocess.STDOUT, text=True, errors='backslashreplace')
+    except subprocess.CalledProcessError as e:
+        print(e.output)
+        raise e
     print(output)
-    if proc.returncode != 0:
-        raise ValueError(f"Run failed: {args}\n{output}")
-    return proc
 
 
 def run_mutation(args):
@@ -32,28 +31,20 @@ def run_mutation(args):
 
     bc_args = shlex.split(args.bc_args)
 
-    if prog.endswith(".bc"):
-        # only run the pre computation algorithm if no mutation should be done
-        if args.mutate == -2:
-            proc_res = run(["/usr/lib/llvm-15/bin/clang++", "-S", "-emit-llvm", *bc_args, prog, "-o", f"{prog[:-3]}.ll"])
-        mutate = f"{prog[:-3]}.ll"
-    else:
-        mutate = prog
-
     # only run the find algorithm if no mutation should be done
     if args.mutate == -2 and not args.mutatelist:
-        arguments = ["python3", "build/install/LLVM_Mutation_Tool/bin/compileAndFind.py", mutate]
+        arguments = ["python3", "/mutator/build/install/LLVM_Mutation_Tool/bin/compileAndFind.py", prog]
         if args.cc:
             arguments.append("-cc")
         if args.cpp:
             arguments.append("-cpp")
         arguments.append("--bc-args=" + args.bc_args)
         arguments.append("--bin-args=" + args.bin_args)
-        proc_res = run(arguments)
+        run(arguments)
 
     # only mutate if a specific mutation id is given
     else:
-        arguments = ["python3", "build/install/LLVM_Mutation_Tool/bin/Mutate.py"]
+        arguments = ["python3", "/mutator/build/install/LLVM_Mutation_Tool/bin/Mutate.py"]
         if args.bitcode:
             arguments.append("-bc")
         if args.bitcode_human_readable:
@@ -78,9 +69,8 @@ def run_mutation(args):
         arguments.append("--bin-args=" + args.bin_args)
         arguments.append("--out-dir=" + args.out_dir)
         # program path
-        arguments.append(mutate)
-        proc_res = run(arguments)
-    sys.exit(proc_res.returncode)
+        arguments.append(prog)
+        run(arguments)
 
 
 def main():

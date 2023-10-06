@@ -2,15 +2,41 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import shlex
 import shutil
+import subprocess
+import sys
 import time
+from dataclasses import is_dataclass, asdict
+from types import FrameType
 from typing import Dict, List, Optional, TypedDict
 
 from data_types import CompileArg, Fuzzer, LocalProgramConfig, Program
 
-from constants import BLOCK_SIZE, IN_DOCKER_SHARED_DIR, SHARED_DIR
+from constants import BLOCK_SIZE, HOST_TMP_PATH, IN_DOCKER_SHARED_DIR, SHARED_DIR
 
 logger = logging.getLogger(__name__)
+
+
+
+
+# Indicates if the evaluation should continue, is mainly used to shut down
+# after a keyboard interrupt by the user.
+# Global variable that is only written in the sigint_handler, as such it is safe
+# to use in a read only fashion by the threads.
+should_run_p = True
+
+
+def should_run() -> bool:
+    global should_run_p
+    return should_run_p
+
+
+# Handler for a keyboard interrupt only sets `should_run` to False.
+def sigint_handler(signum: int, _frame: Optional[FrameType]) -> None:
+    global should_run_p
+    logger.info(f"Got stop signal: ({signum}), stopping!")
+    should_run_p = False
 
 
 def fuzzer_container_tag(name: str) -> str:
@@ -23,22 +49,22 @@ def subject_container_tag(name: str) -> str:
 
 def mutation_locations_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
-    return orig_bc.with_suffix('.ll.mutationlocations')
+    return orig_bc.with_suffix('.bc.mutationlocations')
 
 
 def mutation_locations_graph_path(prog_info: Program) -> Path:
     orig_bc = Path(prog_info.orig_bc)
-    return orig_bc.with_suffix('.ll.mutationlocations.graph')
+    return orig_bc.with_suffix('.bc.mutationlocations.graph')
 
 
 def mutation_detector_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
-    return  orig_bc.with_suffix(".ll.opt_mutate")
+    return  orig_bc.with_suffix(".bc.opt_mutate")
 
 
 def mutation_prog_source_path(prog_info: Program | LocalProgramConfig) -> Path:
     orig_bc = Path(prog_info.orig_bc)
-    return orig_bc.with_suffix('.ll.ll')
+    return orig_bc.with_suffix('.bc.ll')
 
 
 def hash_file(file_path: Path) -> str:
@@ -222,3 +248,108 @@ def load_programs() -> Dict[str, Program]:
                 raise KeyError(f"Key {e} not found in {prog_config_path}")
 
     return programs
+
+
+class CpuCores():
+    def __init__(self, num_cores: int):
+        self.cores: list[bool] = [False]*num_cores
+
+    def try_reserve_core(self) -> Optional[int]:
+        try:
+            idx = self.cores.index(False)
+            self.cores[idx] = True
+            return idx
+        except ValueError:
+            return None
+
+    def release_core(self, idx: int) -> None:
+        assert self.cores[idx] is True, "Trying to release an already free core"
+        self.cores[idx] = False
+
+    def has_free(self) -> bool:
+        return any(cc is False for cc in self.cores)
+
+    def usage(self) -> float:
+        return len([cc for cc in self.cores if cc]) / len(self.cores)
+
+
+class RerunMutationsDict(TypedDict):
+    prog: str
+    mutation_ids: List[int]
+    mode: str
+
+
+def resolve_compile_args(args: List[CompileArg], workdir: str) -> List[str]:
+    resolved = []
+    for arg in args:
+        if arg.action is None:
+            resolved.append(arg.val)
+        elif arg.action == 'prefix_workdir':
+            resolved.append(str(Path(workdir)/arg.val))
+        else:
+            raise ValueError("Unknown action: {}", arg)
+    return resolved
+
+
+def build_compile_args(args: List[CompileArg], workdir: str) -> str:
+    resolved_args = resolve_compile_args(args, workdir)
+    return " ".join(map(shlex.quote, resolved_args))
+
+
+def prepare_shared_and_tmp_dir_local() -> None:
+    # SHARED_DIR
+    if SHARED_DIR.exists():
+        if SHARED_DIR.is_dir():
+            logger.info(f"Cleaning up already existing shared dir: {SHARED_DIR}.")
+            try:
+                shutil.rmtree(SHARED_DIR)
+            except OSError as err:
+                logger.info(f"Could not clean up {SHARED_DIR}: {err}")
+        if SHARED_DIR.is_file():
+            raise Exception(f"The specified location for shared dir is a file: {SHARED_DIR}.")
+
+    SHARED_DIR.mkdir(parents=True)
+
+    # ./tmp
+    for td in ['lib', 'programs', 'unsolved_mutants']:
+        tmp_dir = HOST_TMP_PATH/td
+        if tmp_dir.exists():
+            if tmp_dir.is_dir():
+                logger.info(f"Cleaning up already existing tmp dir: {tmp_dir}.")
+                try:
+                    shutil.rmtree(tmp_dir)
+                except OSError as err:
+                    logger.info(f"Could not clean up {tmp_dir}: {err}")
+            if tmp_dir.is_file():
+                raise Exception(f"The specified location for tmp dir is a file: {tmp_dir}.")
+
+        tmp_dir.mkdir(parents=True)
+
+
+def prepare_shared_dir_and_tmp_dir() -> None:
+    """
+    Prepare the shared dir and ./tmp dir for the evaluation containers.
+    The shared dir will be deleted if it already exists.
+    """
+    
+    prepare_shared_and_tmp_dir_local()
+
+    proc = subprocess.run(f"""
+        docker rm dummy || true
+        docker create -ti --name dummy mutator_mutator bash
+        docker cp dummy:/home/mutator/programs/common/ tmp/programs/common/
+        docker cp dummy:/home/mutator/build/install/LLVM_Mutation_Tool/lib/ tmp/
+        docker rm -f dummy
+    """, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        logger.info(f"Could not extract mutator files.", proc)
+        sys.exit(1)
+
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, o): # type: ignore
+        if is_dataclass(o): # type: ignore[misc]
+            return asdict(o) # type: ignore[misc]
+        if isinstance(o, Path):
+            return str(o)
+        return super().default(o)

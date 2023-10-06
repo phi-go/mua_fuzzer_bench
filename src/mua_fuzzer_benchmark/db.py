@@ -5,7 +5,7 @@ import time
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Set, Tuple, TypeVar, ParamSpec, Concatenate, TYPE_CHECKING, cast
-from data_types import CheckResultKilled, CheckResultTimeout, DoneMutation, InitialSuperMutant, LocalProgramConfig, MutationLocal, Program, MutationType, Mutation, MutationRun, SuperMutant, FuzzerRun, CoveredResult
+from data_types import CheckResultKilled, CheckResultTimeout, CompileArg, DoneMutation, InitialSuperMutant, LocalProgramConfig, MutationLocal, Program, MutationType, Mutation, MutationRun, SuperMutant, FuzzerRun, CoveredResult
 
 from constants import WITH_ASAN, WITH_MSAN
 from helpers import mutation_locations_path, mutation_prog_source_path
@@ -685,6 +685,31 @@ class Stats:
             )
         self.conn.commit()
 
+    @connection
+    def init_local_config_table(self, c: sqlite3.Cursor) -> None:
+        assert self.conn is not None, "connection wrapper returns early if conn is None"
+        c.execute('''
+            CREATE TABLE local_config (
+                prog,
+                locator_path,
+                mutationlocations_path,
+                bc_path,
+                config_path
+            )
+        ''')
+        self.conn.commit()
+
+    @connection
+    def add_local_config(
+        self, c: sqlite3.Cursor, exec_id: str, prog: str,
+        locator_path: str, mutationlocations_path: str, bc_path: str, config_path: str
+    ) -> None:
+        assert self.conn is not None, "connection wrapper returns early if conn is None"
+        c.execute('INSERT INTO local_config VALUES (?, ?, ?, ?, ?)',
+            (prog, locator_path, mutationlocations_path, bc_path, config_path))
+        self.conn.commit()
+        
+
 
 class ReadStatsDb():
     def __init__(self, db_path: Path):
@@ -775,4 +800,31 @@ class ReadStatsDb():
 
         return mutations
 
+    def get_local_config(self) -> Dict[str, Tuple[Path, Path, Path, LocalProgramConfig]]:
+        c = self.db.cursor()
+        local_configs = [  # type: ignore[misc]
+            ee for ee in  # type: ignore[misc]
+            c.execute('select prog, locator_path, mutationlocations_path, bc_path, config_path from local_config')
+        ]
+        c.close()
+        configs: Dict[str, Tuple[Path, Path, Path, LocalProgramConfig]] = {}
 
+        for lc in local_configs:  # type: ignore[misc]
+            prog = str(lc[0])  # type: ignore[misc]
+
+            with open(lc[4], 'rt') as f:  # type: ignore[misc]
+                conf_raw = json.load(f)  # type: ignore[misc]
+                conf_raw['bc_compile_args'] = [CompileArg(**aa) for aa in conf_raw['bc_compile_args']]  # type: ignore[misc]
+                conf_raw['bin_compile_args'] = [CompileArg(**aa) for aa in conf_raw['bin_compile_args']]  # type: ignore[misc]
+                conf = LocalProgramConfig(**conf_raw) # type: ignore[misc]
+
+            loc_path = Path(lc[1])  # type: ignore[misc]
+            assert loc_path.is_file()
+            locations_path = Path(lc[2])  # type: ignore[misc]
+            assert locations_path.is_file()
+            bc_path = Path(lc[3])  # type: ignore[misc]
+            assert bc_path.is_file()
+
+            configs[prog] = (loc_path, locations_path, bc_path, conf)
+
+        return configs

@@ -234,11 +234,6 @@ struct MutatorPlugin : public llvm::PassInfoMixin<MutatorPlugin> {
 
     return (changed ? llvm::PreservedAnalyses::none()
                     : llvm::PreservedAnalyses::all());
-
-    // Here goes what you want to do with a pass
-
-    // Assuming you did not change anything of the IR code
-    return PreservedAnalyses::all();
   }
 
   bool runOnModule(Module &M) {

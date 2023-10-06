@@ -20,6 +20,19 @@ sysroot = ""
 uname = os.uname()
 
 
+def run(args, **kwargs):
+    print("====")
+    print(shlex.join(args), kwargs, flush=True)
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    if proc.returncode == 0:
+        print("SUCCESS", flush=True)
+    else:
+        print("ERROR:", proc.returncode, flush=True)
+        print(proc.stdout.decode(), flush=True)
+        sys.exit(proc.returncode)
+    return proc
+
+
 def mutate_file(args):
     """
     Mutates one file with the given information.
@@ -41,40 +54,38 @@ def mutate_file(args):
     mut_bin = str(mut_bin)
 
     print(f"[INFO] Mutating {mutation} to file {mut_bin}\n")
-    with open(f"{progsource}.ll") as progsource_file:
-        sp_call_args = [opt, "-S", "-load", mutatorplugin, "-mutatorplugin",
-                         "-mutation_pattern", json.dumps(mutation), "-disable-verify", "-o",
-                        f"{mut_bin}.ll"]
+    print(progsource)
+    print(mutatorplugin)
+    print(bc_args)
+    print(bin_args)
+    with open(progsource.with_suffix(".bc"), "r") as progsource_file:
+        sp_call_args = [
+            opt,
+            "--load", mutatorplugin,
+            "--load-pass-plugin", mutatorplugin,
+            "--passes=mutatorplugin",
+            "-mutation_pattern", json.dumps(mutation),
+            "-disable-verify",
+            "-o", f"{mut_bin}.bc"
+        ]
         if is_cpp:
             sp_call_args.append("-cpp")
 
-        subprocess.call(sp_call_args, stdin=progsource_file)
-
-    if args.bitcode:
-        if uname.sysname == "Darwin" and int(uname.release.split('.')[0]) >= 19:
-            subprocess.call([clang, "-emit-llvm", "-fno-inline", "-O3", "-isysroot",
-                             f"{sysroot}", *bc_args,
-                             "-c", f"{mut_bin}.ll",
-                             "-o", f"{mut_bin}.bc"])
-        else:
-            subprocess.call([clang, "-emit-llvm", "-fno-inline", "-O3", *bc_args,
-                             "-c", f"{mut_bin}.ll",
-                             "-o", f"{mut_bin}.bc"])
+        run(sp_call_args, stdin=progsource_file)
 
     if args.binary:
         arguments = [
             # "-v",
-            f"{mut_bin}.ll",  # input file
+            f"{mut_bin}.bc",  # input file
             *bc_args, *bin_args,
             f"-L{dynamic_libraries_folder}",  # points the runtime linker to the location of the included shared library
-            "-lm", "-lz", "-ldl",  # some often used libraries
             f"-l{linked_libraries}",  # the library containing all the api functions that were called by mutations
             "-o", f"{mut_bin}",  # output file
         ]
         if uname.sysname == "Darwin" and int(uname.release.split('.')[0]) >= 19:
-            subprocess.call([clang, "-fno-inline", "-O3", "-isysroot", f"{sysroot}"] + arguments)
+            run([clang, "-fno-inline", "-O3", "-isysroot", f"{sysroot}"] + arguments)
         else:
-            subprocess.call([clang, "-fno-inline", "-O3"] + arguments)
+            run([clang, "-fno-inline", "-O3"] + arguments)
 
     if not args.bitcode_human_readable:
         os.remove(f"{mut_bin}.ll")
@@ -83,18 +94,16 @@ def mutate_file(args):
 def mutate(sysroot, clang, args):
     # "${CLANG}" -g -S -D_FORTIFY_SOURCE=0 "${SYSROOT}" -emit-llvm -include "${INCDIR}/traceinstr/wrapper_libc.h" -o "${PROG_SOURCE}.uninstrumented.bc" -x c "${PROG_SOURCE}"
     # "${LLVM}/opt" -S -instnamer -reg2mem -load "${TRACEPLUGIN}" -traceplugin -exclude_functions "${EXCLUDED_FUNCTIONS}" -disable-verify "${PROG_SOURCE}.uninstrumented.bc" -o  "${PROG_SOURCE}.opt_debug.bc"
-    prog = args.program
+    prog = Path(args.program)
 
-    basepath = os.path.dirname(prog)
-    if args.out_dir == "":
-        mutations_folder = os.path.join(basepath, "mutations")
-    else:
-        mutations_folder = args.out_dir
+    mutations_folder = args.out_dir
     progname = os.path.basename(prog)
+
     print(f"[INFO] Folder to put mutations into: {mutations_folder}")
-    shutil.rmtree(mutations_folder, ignore_errors=True)
-    os.makedirs(mutations_folder)
-    with open(f"{prog}.mutationlocations") as mutations:
+    # shutil.rmtree(mutations_folder, ignore_errors=True)
+    # os.makedirs(mutations_folder)
+
+    with open(prog.with_suffix(".mutationlocations"), "rt") as mutations:
         mutation_list = []
         mutation_jsondata = json.load(mutations)
         # if args.mutate is -1 then all mutation files should be created, otherwise just the one with the defined id
@@ -116,8 +125,8 @@ def mutate(sysroot, clang, args):
             print("Neither mutation ID nor mutation given, please define what to mutate!")
         # TODO later this will get logged to have for each id the correct pattern used
         if mutation_list:
-            pool = ThreadPool(cpu_count())
-            pool.map(mutate_file, mutation_list)
+            for ml in mutation_list:
+                mutate_file(ml)
         else:
             raise LookupError(f"Could not find mutation with id {args.mutate} in file {prog}.mutationlocations")
 
@@ -144,7 +153,7 @@ def main():
                         help="Compiler arguments that should be used for compilation for all artifacts.")
     parser.add_argument("--bin-args", default="",
                         help="Compiler arguments that should be used for compilation of the binary.")
-    parser.add_argument("--out-dir", type=str, default="",
+    parser.add_argument("--out-dir", type=str, required=True,
                         help="Path to output directory, where artifacts will be written to.")
     parser.add_argument("program", type=str,
                         help="Path to the source file that will be mutated.")
@@ -169,5 +178,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(e)
+        sys.exit(1)
 

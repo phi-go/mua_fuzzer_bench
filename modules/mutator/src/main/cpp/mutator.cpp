@@ -14,7 +14,9 @@
 #include <llvm/Support/CommandLine.h>
 #include <iostream>
 
-#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
 
@@ -23,10 +25,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "mutator"
 
-cl::opt<std::string> Mutation("mutation_pattern",
+static cl::opt<std::string> Mutation("mutation_pattern",
                                    cl::desc("the source location and mutation pattern"),
                                    cl::value_desc("string"));
-cl::opt<bool> CPP("cpp", cl::desc("Enable CPP-only mutations"));
+static cl::opt<bool> CPP("cpp", cl::desc("Enable CPP-only mutations"));
 
 namespace {
 //counter for method calls, each method call gets a unique ID
@@ -38,6 +40,7 @@ namespace {
 
 // the following variables define the location of the mutation as well as the pattern
 // containing in order: Directory, File, line, column, mutation-ID as strings
+    using json = nlohmann::json;
     json seglist;
 
     class Worker {
@@ -138,9 +141,21 @@ namespace {
         }
     };
 
-    struct MutatorPlugin : public ModulePass {
-        static char ID; // Pass identification, replacement for typeid
-        MutatorPlugin() : ModulePass(ID) {}
+    struct MutatorPlugin : public llvm::PassInfoMixin<MutatorPlugin> {
+        // Without isRequired returning true, this pass will be skipped for functions
+        // decorated with the optnone LLVM attribute. Note that clang -O0 decorates
+        // all functions with optnone.
+        static bool isRequired() { return true; }
+
+        PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+
+            std::cout << "MutationFinder Pass" << std::endl;
+
+            bool changed =  runOnModule(M);
+
+            return (changed ? llvm::PreservedAnalyses::none()
+                            : llvm::PreservedAnalyses::all());
+        }
 
         bool runOnModule(Module &M) {
             auto &llvm_context = M.getContext();
@@ -186,10 +201,20 @@ namespace {
     };
 }
 
-char MutatorPlugin::ID = 0;
-static RegisterPass<MutatorPlugin> X("mutatorplugin", "Plugin to mutate a bitcode file.", false, false);
-
-static RegisterStandardPasses Y(
-        PassManagerBuilder::EP_OptimizerLast,
-        [](const PassManagerBuilder &Builder,
-           legacy::PassManagerBase &PM) { PM.add(new MutatorPlugin()); });
+//-----------------------------------------------------------------------------
+// New PM Registration
+//-----------------------------------------------------------------------------
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "MutationPlugin", "v0.1",
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [&](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+                    if(Name == "mutatorplugin") {
+                        MPM.addPass(MutatorPlugin());
+                        return true;
+                    }
+                    return false;
+                });
+          }};
+}

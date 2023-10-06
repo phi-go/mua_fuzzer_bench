@@ -32,23 +32,9 @@ from docker_interaction import DockerLogStreamer, run_exec_in_container, start_m
 from constants import EXEC_ID, LOCAL_LIB_DIR, MAX_RETRY_COUNT, MUT_BC_SUFFIX, MUT_LL_SUFFIX, MUTATOR_LLVM_DOCKERFILE_PATH, MUTATOR_LLVM_IMAGE_NAME, MUTATOR_MUTATOR_IMAGE_NAME, MUTATOR_MUTATOR_DOCKERFILE_PATH, NUM_CPUS, PRIO_CHECK_MUTANT, PRIO_CHECK_RUN, PRIO_FUZZ_RUN, PRIO_MUTANT, PRIO_RECOMPILE_MUTANT, WITH_ASAN, WITH_MSAN, RM_WORKDIR, FILTER_MUTATIONS, \
     JUST_SEEDS, STOP_ON_MULTI, SKIP_LOCATOR_SEED_CHECK, CHECK_INTERVAL, \
     HOST_TMP_PATH, UNSOLVED_MUTANTS_DIR, IN_DOCKER_WORKDIR, SHARED_DIR, IN_DOCKER_SHARED_DIR, LOCAL_ROOT_DIR
-from helpers import CoveredFile, fuzzer_container_tag, get_seed_dir, hash_file, load_fuzzers, load_programs, mutation_detector_path, mutation_locations_path, mutation_prog_source_path, shared_dir_to_docker, subject_container_tag
+from local_run import locator_local, locator_mutants_local
+from helpers import CoveredFile, CpuCores, RerunMutationsDict, build_compile_args, fuzzer_container_tag, get_seed_dir, hash_file, load_fuzzers, load_programs, mutation_detector_path, mutation_locations_path, mutation_prog_source_path, prepare_shared_dir_and_tmp_dir, shared_dir_to_docker, subject_container_tag
 from db import ReadStatsDb, Stats
-
-
-class CustomJSONEncoder(json.JSONEncoder):
-    def default(self, o): # type: ignore
-        if is_dataclass(o): # type: ignore[misc]
-            return asdict(o) # type: ignore[misc]
-        if isinstance(o, Path):
-            return str(o)
-        return super().default(o)
-
-
-class RerunMutationsDict(TypedDict):
-    prog: str
-    mutation_ids: List[int]
-    mode: str
 
 # set up logging to file
 logging.basicConfig(
@@ -79,13 +65,7 @@ logger = logging.getLogger(__name__)
 # after a keyboard interrupt by the user.
 # Global variable that is only written in the sigint_handler, as such it is safe
 # to use in a read only fashion by the threads.
-should_run = True
-
-# Handler for a keyboard interrupt only sets `should_run` to False.
-def sigint_handler(signum: int, _frame: Optional[FrameType]) -> None:
-    global should_run
-    logger.info(f"Got stop signal: ({signum}), stopping!")
-    should_run = False
+from helpers import should_run, sigint_handler
 
 
 FUZZERS = load_fuzzers()
@@ -96,29 +76,6 @@ class CoverageException(Exception):
     def __init__(self, run: Dict[str, Union[int, str, bool]]):
         super().__init__(run)
         self.run = run
-
-
-class CpuCores():
-    def __init__(self, num_cores: int):
-        self.cores: list[bool] = [False]*num_cores
-
-    def try_reserve_core(self) -> Optional[int]:
-        try:
-            idx = self.cores.index(False)
-            self.cores[idx] = True
-            return idx
-        except ValueError:
-            return None
-
-    def release_core(self, idx: int) -> None:
-        assert self.cores[idx] is True, "Trying to release an already free core"
-        self.cores[idx] = False
-
-    def has_free(self) -> bool:
-        return any(cc is False for cc in self.cores)
-
-    def usage(self) -> float:
-        return len([cc for cc in self.cores if cc]) / len(self.cores)
 
 
 class PreparedRuns():
@@ -425,7 +382,6 @@ def stop_container(container: Container) -> None:
 # Does all the eval steps, each fuzzer eval function is based on this one.
 # Compiles the mutated program and fuzzes it. Finally the eval data is returned.
 def base_eval(run_data: FuzzerRun) -> RunResult:
-    global should_run
 
     # get start time for the eval
     start_time = time.time()
@@ -519,7 +475,7 @@ def base_eval(run_data: FuzzerRun) -> RunResult:
         DockerLogStreamer(logs_queue, container).start()
 
         fuzz_start_time = time.time()
-        while time.time() < fuzz_start_time + timeout and should_run:
+        while time.time() < fuzz_start_time + timeout and should_run():
             # check if the process stopped, this should only happen in an
             # error case
             try:
@@ -596,18 +552,6 @@ def add_covered_mut_id(
                    start_time)
 
 
-def resolve_compile_args(args: List[CompileArg], workdir: str) -> List[str]:
-    resolved = []
-    for arg in args:
-        if arg.action is None:
-            resolved.append(arg.val)
-        elif arg.action == 'prefix_workdir':
-            resolved.append(str(Path(workdir)/arg.val))
-        else:
-            raise ValueError("Unknown action: {}", arg)
-    return resolved
-
-
 def prepend_main_arg_local(args: List[CompileArg]) -> List[CompileArg]:
     return [
         CompileArg(val="dockerfiles/programs/common/main.cc", action='prefix_workdir'),
@@ -622,16 +566,10 @@ def prepend_main_arg(args: List[CompileArg]) -> List[CompileArg]:
     ]
 
 
-def build_compile_args(args: List[CompileArg], workdir: str) -> str:
-    resolved_args = resolve_compile_args(args, workdir)
-    return " ".join(map(shlex.quote, resolved_args))
-
-
 def check_run(run_data: CheckRun) -> RunResult:
     # get start time for the eval
     start_time = time.time()
 
-    global should_run
     # extract used values
     mut_data = run_data.mut_data
     timeout = run_data.timeout
@@ -2426,7 +2364,6 @@ def run_eval(
     fresh_images: bool,
     result_path_s: str,
 ) -> None:
-    global should_run
     tmp_db_path = SHARED_DIR/"mutator/stats.db"
     result_path = Path(result_path_s).with_suffix(".db")
     assert not result_path.exists(), f"Result path {result_path} already exists."
@@ -2512,7 +2449,7 @@ def run_eval(
         while True:
             # Check if a core is free, if so start next task.
             core = cores.try_reserve_core()
-            if core is not None and should_run:
+            if core is not None and should_run():
                 ii = start_next_task(prepared_runs, all_runs, tasks, executor, stats, start_time, num_runs, core, ii)
                 # add tasks while there are more free cores
                 if cores.has_free():
@@ -2550,7 +2487,6 @@ def get_mutation_locator_and_data(
             logger.error(err)
             logger.error(f"Prog: {prog} is not known, known progs are: {PROGRAMS.keys()}")
             sys.exit(1)
-        start = time.time()
         logger.info("="*50)
         logger.info(f"Compiling base and locating mutations for {prog}")
 
@@ -2952,7 +2888,7 @@ def locator_mutants(
         while True:
             # Check if a core is free, if so start next task.
             core = cores.try_reserve_core()
-            if core is not None and should_run:
+            if core is not None and should_run():
                 ii = start_next_task(prepared_runs, all_runs, tasks, executor, stats, start_time, num_runs, core, ii)
                 # add tasks while there are more free cores
                 if cores.has_free():
@@ -2971,236 +2907,6 @@ def locator_mutants(
 
     # Copy the stats db to the result path
     shutil.copy(tmp_db_path, result_path)
-
-
-def load_local_config(config_path_s: str) -> List[LocalProgramConfig]:
-    def load_compile_arg(elem: Any) -> CompileArg:  # type: ignore[misc]
-        assert isinstance(elem, dict), f"Expected dict, with keys 'val' and 'action', got {type(elem)}"  # type: ignore[misc]
-        assert 'val' in elem.keys(), f"Expected dict, with keys 'val' and 'action', got {elem.keys()}"
-        assert 'action' in elem.keys(), f"Expected dict, with keys 'val' and 'action', got {elem.keys()}"
-        return CompileArg(elem['val'], elem['action'])
-
-
-    config_path = Path(config_path_s)
-    assert config_path.is_file(), f"Config path {config_path} does not exist or is not a file."
-
-    config = []
-    with open(config_path, "rt") as f:
-        data_raw = json.load(f) # type: ignore[misc]
-        for prog, prog_data in data_raw.items(): # type: ignore[misc]
-            config.append(LocalProgramConfig(
-                name=prog, # type: ignore[misc]
-                bc_compile_args=[load_compile_arg(aa) for aa in prog_data['bc_compile_args']], # type: ignore[misc]
-                bin_compile_args=[load_compile_arg(aa) for aa in prog_data['bin_compile_args']], # type: ignore[misc]
-                is_cpp=prog_data['is_cpp'], # type: ignore[misc]
-                orig_bc=Path(prog_data['orig_bc']).absolute(), # type: ignore[misc]
-                omit_functions=prog_data['omit_functions'], # type: ignore[misc]
-            ))
-    return config
-
-
-def run_exec_local(
-        raise_on_error: bool,
-        cmd: List[str],
-        timeout: Optional[int] = None
-) -> Dict[str, Union[int, str, bool]]:
-    """
-    Run command locally.
-    If return_code is not 0, raise a ValueError containing the run result.
-    """
-    timed_out = False
-    # cmd: List[str] = ["docker", "exec", *(exec_args if exec_args is not None else []), container_name, *cmd]
-    with subprocess.Popen(cmd,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        close_fds=True,
-        errors='backslashreplace',  # text mode: stdout is a str
-        # preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
-    ) as proc:
-        try:
-            stdout, _ = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _ = proc.communicate(timeout=10)
-            timed_out = True
-        except Exception:
-            proc.kill()
-            proc.wait()
-            raise
-
-        returncode = proc.poll()
-        print(returncode, stdout)
-
-        assert isinstance(returncode, int)
-        if raise_on_error and returncode != 0:
-            logger.debug(f"process error (timed out): {str(proc.args)}\n{stdout}")
-            raise ValueError(f"exec_in_docker failed (timed out)\nexec_code: {returncode}\n{stdout}")
-
-        return {'returncode': returncode, 'out': stdout, 'timed_out': timed_out}
-
-
-def instrument_prog_local(prog_config: LocalProgramConfig) -> Dict[str, Union[int, str, bool]]:
-    # Compile the mutation location detector for the prog.
-    args = ["./run_mutation.py",
-            "-bc", str(prog_config.orig_bc),
-            *(["-cpp"] if prog_config.is_cpp else ['-cc']),  # specify compiler
-            "--bc-args=" + build_compile_args(
-                prog_config.bc_compile_args, str(LOCAL_ROOT_DIR)),
-            "--bin-args=" + build_compile_args(
-                prog_config.bin_compile_args, str(LOCAL_ROOT_DIR))]
-    try:
-        return run_exec_local(True, args)
-    except Exception as e:
-        logger.warning(f"Exception during instrumenting {e}")
-        raise e
-
-
-# def new_mutation_local(
-#     mutation_id: int,
-#     mutation_data: Dict[str, str],
-#     prog: LocalProgramConfig
-# ) -> MutationLocal:
-#     return MutationLocal(
-#         mutation_id=int(mutation_id),
-#         prog=prog,
-#         type_id=mutation_data.pop('type'),
-#         directory=mutation_data.pop('directory'),
-#         filePath=mutation_data.pop('filePath'),
-#         line=int(mutation_data.pop('line')),
-#         column=int(mutation_data.pop('column')),
-#         instr=mutation_data.pop('instr'),
-#         funname=mutation_data.pop('funname'),
-#         additional_info=json.dumps(mutation_data)  # might not all be str
-#     )
-
-
-def get_mutation_locator_and_data_local(
-    stats: Stats,
-    progs: List[LocalProgramConfig],
-) -> List[Tuple[str, Path, Path]]:
-    "Get the mutation locator executable and the data for all mutations."
-
-    progs_locator: List[Tuple[str, Path, Path]] = []
-
-    for prog_config in progs:
-        start = time.time()
-        logger.info("="*50)
-        logger.info(f"Compiling base and locating mutations for {prog_config.name}")
-
-        instrument_result = instrument_prog_local(prog_config)
-
-        # # get info on mutations
-        # with open(mutation_locations_path(prog_config), 'rt') as f:
-        #     mutation_data: List[Dict[str, str]] = json.load(f)
-
-        # mutations = list(new_mutation_local(int(p['UID']), p, prog_config) for p in mutation_data)
-
-        # # Remove mutations for functions that should not be mutated
-        # omit_functions = prog_config.omit_functions
-        # mutations = [mm for mm in mutations if mm.funname not in omit_functions]
-
-        # bc_path = Path(prog_config.orig_bc)
-        # detector_path = mutation_detector_path(prog_config)
-
-        # stats.new_prog(EXEC_ID, prog_config.name, prog_config)
-
-        # logger.info(f"Found {len(mutations)} mutations for {prog}")
-        # for mut in mutations:
-        #     stats.new_mutation(EXEC_ID, mut)
-
-        # progs_locator.append((prog, bc_path, detector_path))
-
-    return progs_locator
-
-
-def locator_local(
-    config_path_s: str,
-    result_path_s: str,
-) -> None:
-    result_path = Path(result_path_s).absolute()
-    assert not result_path.exists(), f"Result path {result_path} already exists."
-
-    config = load_local_config(config_path_s)
-    assert len(config) > 0, "No programs found in config."
-    for prog_config in config:
-        assert prog_config.orig_bc.is_file(), f"Orig bc {prog_config.orig_bc} is not a file."
-
-    # change workdir to that of the script
-    os.chdir(LOCAL_ROOT_DIR)
-
-    # prepare_mutator_docker_image(fresh_images)
-    prepare_shared_and_tmp_dir_local()
-
-    # # run ldconfig to make sure our mutator lib is found
-    # run_exec_local(True, ["ldconfig", "-n", str(LOCAL_LIB_DIR)])
-
-    execution_start_time = time.time()
-
-    # prepare environment
-    base_shm_dir = SHARED_DIR/"mua_locator"
-    base_shm_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize the stats object
-    tmp_db_path = base_shm_dir/"stats.db"
-    stats = Stats(str(tmp_db_path))
-
-    # Record current eval execution data
-    # Get the current git status
-    logger.warning("WARNING: git status is not recorded for local locator runs.")
-    # git_status = get_git_status()
-    git_status = "local"
-    stats.new_execution(
-        EXEC_ID, platform.uname()[1], git_status, None, execution_start_time,
-        json.dumps({ # type: ignore[misc]
-                'config': config,
-            },
-            cls=CustomJSONEncoder # type: ignore[misc]
-        ),
-        json.dumps({k: v for k, v in os.environ.items()}) # type: ignore[misc]
-    )
-
-    class MutationDocEntry(TypedDict):
-        pattern_name: str
-        typeID: int
-        pattern_location: str
-        pattern_class: str
-        description: str
-        procedure: str
-
-    # Get a record of all mutation types.
-    with open("mutation_doc.json", "rt") as f:
-        mutation_types: List[MutationDocEntry] = json.load(f)
-        for mt in mutation_types:
-            mutation_type = MutationType(
-                pattern_name=mt['pattern_name'],
-                type_id=mt['typeID'],
-                pattern_location=mt['pattern_location'],
-                pattern_class=mt['pattern_class'],
-                description=mt['description'],
-                procedure=mt['procedure'],
-            )
-            stats.new_mutation_type(mutation_type)
-
-    locators = get_mutation_locator_and_data_local(stats, config)
-
-    # for prog, bc_path, locator in locators:
-    #     result_prog_path = result_path/"progs"/f"{prog}"
-    #     result_prog_path.mkdir(parents=True, exist_ok=False)
-    #     result_locator_path = result_prog_path/"locator"
-    #     shutil.copy(locator, result_locator_path)
-    #     result_bc_path = result_prog_path/"bc"
-    #     shutil.copy(bc_path, result_bc_path)
-    #     print(f"bc and locator for {prog} copied to {result_locator_path}")
-
-    # shutil.copytree(HOST_TMP_PATH/"lib", result_path/"lib")
-    # print(f"lib copied to {result_path/'lib'}")
-
-    # # Record total time for this execution.
-    # stats.execution_done(EXEC_ID, time.time() - execution_start_time)
-
-    # result_path.mkdir(parents=True, exist_ok=True)
-    # # Copy the stats db to the result path
-    # result_db_path = result_path.joinpath("stats.db")
-    # shutil.copy(tmp_db_path, result_db_path)
 
 
 def get_seed_gathering_runs(
@@ -3319,7 +3025,6 @@ def handle_seed_run_result(run_future: Future[SeedRunResult], run_data: SeedRun,
 
 
 def seed_gathering_run(run_data: SeedRun) -> SeedRunResult:
-    global should_run
     start_time = time.time()
     docker_image = fuzzer_container_tag(run_data.fuzzer)
     # extract used values
@@ -3365,7 +3070,7 @@ def seed_gathering_run(run_data: SeedRun) -> SeedRunResult:
     DockerLogStreamer(logs_queue, container).start()
 
     fuzz_time = time.time()
-    while time.time() < fuzz_time + timeout and should_run:
+    while time.time() < fuzz_time + timeout and should_run():
         # check if the process stopped, this should only happen in an
         # error case
         try:
@@ -3395,7 +3100,7 @@ def seed_gathering_run(run_data: SeedRun) -> SeedRunResult:
 
     all_logs = get_logs(logs_queue)
 
-    if should_run and time.time() - timeout < start_time:
+    if should_run() and time.time() - timeout < start_time:
         # The runtime is less than the timeout, something went wrong.
         logger.warning(f"{''.join(all_logs)}")
         raise RuntimeError(''.join(all_logs))
@@ -3414,7 +3119,6 @@ def gather_seeds(
     progs: List[str], fuzzers: List[str], timeout: str, num_repeats: int,
     source_dir: Path, destination_dir: Path, fresh_images: bool
 ) -> None:
-    global should_run
 
     # source_dir = Path(source_dir_s)
     # destination_dir = Path(destination_dir_s)
@@ -3443,7 +3147,7 @@ def gather_seeds(
             # Check if a core is free
             core = cores.try_reserve_core()
 
-            if should_run and core is not None and len(all_runs) > 0:
+            if should_run() and core is not None and len(all_runs) > 0:
                 # A core is free and there are still runs to do and we want to continue running, start a new task.
 
                 run_data = all_runs.pop()
@@ -3464,7 +3168,7 @@ def gather_seeds(
                 logger.info(f"Waiting for one of {len(tasks)} tasks.")
                 wait_for_seed_run(tasks, cores, all_runs)
 
-        assert len(all_runs) == 0 or should_run is False
+        assert len(all_runs) == 0 or should_run() is False
 
     logger.info("Copying seeds to target dir ...")
     all_runs_dir = destination_dir/"all_runs"
@@ -3727,7 +3431,6 @@ def measure_mutation_coverage(
 
 
 def seed_minimization_run(run_data: MinimizeSeedRun) -> Dict[str, List[str]]:
-    global should_run
     start_time = time.time()
     docker_image = fuzzer_container_tag(run_data.fuzzer)
     # extract used values
@@ -3772,7 +3475,7 @@ def seed_minimization_run(run_data: MinimizeSeedRun) -> Dict[str, List[str]]:
     logs_queue: queue.Queue[str] = queue.Queue()
     DockerLogStreamer(logs_queue, container).start()
 
-    while should_run:
+    while should_run():
         # check if the process stopped, this should only happen in an
         # error case
         try:
@@ -3863,7 +3566,6 @@ def minimize_seeds_one(base_shm_dir: Path, prog_name: str, fuzzer: str, in_path:
 
 
 def minimize_seeds(seed_path_base_s: str, res_path_base_s: str, fuzzers: List[str], progs: List[str], per_fuzzer: bool) -> None:
-    global should_run
     seed_path_base = Path(seed_path_base_s)
     res_path_base = Path(res_path_base_s)
 
@@ -3879,7 +3581,7 @@ def minimize_seeds(seed_path_base_s: str, res_path_base_s: str, fuzzers: List[st
     build_docker_images(fuzzers, progs)
 
     for prog, fuzzer in product(progs, fuzzers):
-        if not should_run:
+        if not should_run():
             break
 
         # Gather all data to start a seed minimization run
@@ -3897,8 +3599,6 @@ def minimize_seeds(seed_path_base_s: str, res_path_base_s: str, fuzzers: List[st
 
 
 def seed_coverage_run(run_data: KCovRun, docker_image: str) -> List[str]:
-    global should_run
-
     # extract used values
     workdir = run_data.workdir
     orig_bin = run_data.orig_bin
@@ -3939,7 +3639,7 @@ def seed_coverage_run(run_data: KCovRun, docker_image: str) -> List[str]:
     logs_queue: queue.Queue[str] = queue.Queue()
     DockerLogStreamer(logs_queue, container).start()
 
-    while should_run:
+    while should_run():
         # check if the process stopped, this should only happen in an
         # error case
         try:
@@ -3973,7 +3673,6 @@ def seed_coverage_run(run_data: KCovRun, docker_image: str) -> List[str]:
 
 
 def get_kcov(prog_name: str, seed_path: Path, res_path_s: str) -> None:
-    global should_run
     prog = PROGRAMS[prog_name]
     res_path = Path(res_path_s)
 
@@ -4099,56 +3798,6 @@ def prepare_mutator_docker_image(fresh_images: bool) -> None:
     #     print_fail("Mutator image was not properly built. Check output for details.")
     #     exit(1)
     # print_pass("Successfully built Mutator Docker container.")
-
-
-def prepare_shared_and_tmp_dir_local() -> None:
-    # SHARED_DIR
-    if SHARED_DIR.exists():
-        if SHARED_DIR.is_dir():
-            logger.info(f"Cleaning up already existing shared dir: {SHARED_DIR}.")
-            try:
-                shutil.rmtree(SHARED_DIR)
-            except OSError as err:
-                logger.info(f"Could not clean up {SHARED_DIR}: {err}")
-        if SHARED_DIR.is_file():
-            raise Exception(f"The specified location for shared dir is a file: {SHARED_DIR}.")
-
-    SHARED_DIR.mkdir(parents=True)
-
-    # ./tmp
-    for td in ['lib', 'programs', 'unsolved_mutants']:
-        tmp_dir = HOST_TMP_PATH/td
-        if tmp_dir.exists():
-            if tmp_dir.is_dir():
-                logger.info(f"Cleaning up already existing tmp dir: {tmp_dir}.")
-                try:
-                    shutil.rmtree(tmp_dir)
-                except OSError as err:
-                    logger.info(f"Could not clean up {tmp_dir}: {err}")
-            if tmp_dir.is_file():
-                raise Exception(f"The specified location for tmp dir is a file: {tmp_dir}.")
-
-        tmp_dir.mkdir(parents=True)
-
-
-def prepare_shared_dir_and_tmp_dir() -> None:
-    """
-    Prepare the shared dir and ./tmp dir for the evaluation containers.
-    The shared dir will be deleted if it already exists.
-    """
-    
-    prepare_shared_and_tmp_dir_local()
-
-    proc = subprocess.run(f"""
-        docker rm dummy || true
-        docker create -ti --name dummy mutator_mutator bash
-        docker cp dummy:/home/mutator/programs/common/ tmp/programs/common/
-        docker cp dummy:/home/mutator/build/install/LLVM_Mutation_Tool/lib/ tmp/
-        docker rm -f dummy
-    """, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        logger.info(f"Could not extract mutator files.", proc)
-        sys.exit(1)
 
 
 def generate_rerun_file(
@@ -4356,8 +4005,8 @@ def main() -> None:
 
     # CMD: locator_mutants 
     subparser = subparsers.add_parser('locator_mutants',
-        help="Run the evaluation executing the requested fuzzers (--fuzzers) on "
-             "the requested programs (--progs) and gather the resulting data.")
+        help="Compile mutant executables specified in `--mutation-list` using "
+             "the `--statsdb`, writing the result to `--result-path`.")
     subparser.add_argument("--result-path", required=True,
         help='The path where the result database should be written to. The path '
          'will checked to not exist. The extension will be overwritten with ".db". '
@@ -4389,6 +4038,28 @@ def main() -> None:
             "describing the the compilation.")
     del subparser
 
+    # CMD: locator_mutants_local
+    subparser = subparsers.add_parser('locator_mutants_local',
+        help="Run the evaluation executing the requested fuzzers (--fuzzers) on "
+             "the requested programs (--progs) and gather the resulting data.")
+    subparser.add_argument("--result-path", required=True,
+        help='The path where the result database should be written to. The path '
+         'will checked to not exist. The extension will be overwritten with ".db". '
+         'Note that the database will only be copied to this location once the '
+         'evaluation finishes.')
+    subparser.add_argument("--statsdb", required=True,
+        help="Rerun a previous experiment based on that runs database. "
+             "Requires a path to the database as the argument. "
+             "The rerun is done by restoring the bitcode and mutationlocation files "
+             "as well as the supermutants for each program.")
+    subparser.add_argument("--mutation-list", required=True,
+        help="Path to a json file containing a list of mutation ids for each program to rerun, "
+             "as well as a mode specifying if the original supermutants should be restored (keep) or each "
+             "mutation should be analyzed individually (single). "
+             "Requires the --rerun option to be used. Example: "
+             '{["prog": "<prog>", "ids": [1, 2, 3], "mode": "single"}]')
+    del subparser
+
     args = parser.parse_args()
 
     cmd = args.cmd
@@ -4416,6 +4087,8 @@ def main() -> None:
         locator_mutants(args.statsdb, args.mutation_list, args.result_path)
     elif cmd == 'locator_local':
         locator_local(args.config_path, args.result_path)
+    elif cmd == 'locator_mutants_local':
+        locator_mutants_local(args.statsdb, args.mutation_list, args.result_path)
     else:
         parser.print_help(sys.stderr)
 
