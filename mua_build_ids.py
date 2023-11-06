@@ -2,6 +2,8 @@
 
 import os, argparse, random, subprocess, json
 
+from multiprocessing import Pool
+
 # check which mutation are covered => these mutants are needed
 # check if needed mutants are in mutant storage
 # if mutants are in storage, copy into mutant directory        
@@ -16,8 +18,48 @@ import os, argparse, random, subprocess, json
 # cd /mutator && python locator_signal_to_mutation_list.py --trigger-signal-dir /tmp/trigger_signal/ --prog xml --out /tmp/mualist.json && cat /tmp/mualist.json
 # cd /mutator && MUT_NUM_CPUS=24 pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_mutants_local --result-path /tmp/mutants_$(date +"%Y%m%d_%H%M%S") --statsdb /tmp/test/stats.db --mutation-list /tmp/mualist.json
 
+POOL_SIZE = 10
+
+mutants_dir = ''
+fuzz_target = ''
+
+def build_mutants(all_ids):
+
+    # shuffle to avoid continously racing builts
+    random.shuffle(all_ids)
+
+    # built covered mutant if not build yet
+
+    for id in all_ids:
+
+        # if mutant exists, do not build
+        mutant_file = mutants_dir+str(id)
+        config_file = mutant_file+".json"
+        
+        if(os.path.exists(mutant_file)):
+            continue
+        if(os.path.isfile(config_file)):
+            continue
+        
+        # create config file
+        mutationlist = list()
+        with open(config_file, "w") as f:
+            json.dump([{
+                "prog": fuzz_target,
+                "mutation_ids": [id],
+                "mode": "single",
+            }], f)
+        
+        # build new mutant and store it in mutants_dir
+        build_command = 'pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_mutants_local --result-path '+mutant_file+' --statsdb /tmp/test/stats.db --mutation-list '+config_file
+        subprocess.run(build_command.split(' '), cwd='/mutator')
+        #cleanup
+        os.remove(config_file)
+
 
 def main():
+    global mutants_dir
+    global fuzz_target
 
     parser = argparse.ArgumentParser(
                     prog='mua_build_ids',
@@ -71,36 +113,10 @@ def main():
             continue
         all_ids.append(int(id_entry))
 
-    # shuffle to avoid continously racing builts
-    random.shuffle(all_ids)
 
-    # built covered mutant if not build yet
-
-    for id in all_ids:
-        # if mutant exists, do not build
-        mutant_file = mutants_dir+str(id)
-        config_file = mutant_file+".json"
+    # build mutants
+    pool = Pool(POOL_SIZE)
+    pool.map(build_mutants, POOL_SIZE*[all_ids])
         
-        if(os.path.exists(mutant_file)):
-            continue
-        if(os.path.isfile(config_file)):
-            continue
-        
-        # create config file
-        mutationlist = list()
-        with open(config_file, "w") as f:
-            json.dump([{
-                "prog": fuzz_target,
-                "mutation_ids": [id],
-                "mode": "single",
-            }], f)
-        
-        # build new mutant and store it in mutants_dir
-        build_command = 'pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_mutants_local --result-path '+mutant_file+' --statsdb /tmp/test/stats.db --mutation-list '+config_file
-
-        subprocess.run(build_command.split(' '), cwd='/mutator')
-
-        #cleanup
-        os.remove(config_file)
 
 main()
