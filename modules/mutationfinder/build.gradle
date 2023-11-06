@@ -7,7 +7,7 @@ apply plugin: 'cpp-library'
 
 def llvmConfigVariable(variable, components = []) {
     if (!file("${llvmBinPath}llvm-config").exists()) {
-        throw new GradleException("missing llvm-config script")
+        throw new GradleException("missing llvm-config script: "+"${llvmBinPath}llvm-config")
     }
 
     def componentsString = String.join(' ', components)
