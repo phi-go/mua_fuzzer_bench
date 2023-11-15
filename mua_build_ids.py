@@ -4,24 +4,26 @@ import os, argparse, random, subprocess, json
 
 from multiprocessing import Pool
 
-# check which mutation are covered => these mutants are needed
-# check if needed mutants are in mutant storage
-# if mutants are in storage, copy into mutant directory        
-# if mutants are not in storage, build mutants and add to storage
-
-
-# pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_local --config-path /tmp/config.json --result-path /tmp/test/ # stores infos in /tmp/test
-
-#/tmp/test/progs/'+fuzz_target+'/'+fuzz_target+'.locator /benchmark.yaml
-
-# /tmp/test/progs/xml/xml.locator /benchmark.yaml #create a list of all possible mutations
-# cd /mutator && python locator_signal_to_mutation_list.py --trigger-signal-dir /tmp/trigger_signal/ --prog xml --out /tmp/mualist.json && cat /tmp/mualist.json
-# cd /mutator && MUT_NUM_CPUS=24 pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_mutants_local --result-path /tmp/mutants_$(date +"%Y%m%d_%H%M%S") --statsdb /tmp/test/stats.db --mutation-list /tmp/mualist.json
-
 POOL_SIZE = 10
 
 mutants_dir = ''
 fuzz_target = ''
+
+import fcntl
+
+def acquireLock(path):
+    ''' acquire exclusive lock file access '''
+    locked_file_descriptor = open(path, 'w+')
+    try:
+        fcntl.lockf(locked_file_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # another instance already locked this
+        return None
+    return locked_file_descriptor
+
+def releaseLock(locked_file_descriptor):
+    ''' release exclusive lock file access '''
+    locked_file_descriptor.close()
 
 def build_mutants(all_ids):
 
@@ -31,6 +33,11 @@ def build_mutants(all_ids):
     # built covered mutant if not build yet
 
     for id in all_ids:
+        mutant_lock = mutants_dir+str(id)+'.lock'
+        lock_fd = acquireLock(mutant_lock)
+        if lock_fd is None:
+            # lock is already taken
+            continue
 
         # if mutant exists, do not build
         mutant_file = mutants_dir+str(id)
@@ -54,7 +61,9 @@ def build_mutants(all_ids):
         build_command = 'pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_mutants_local --result-path '+mutant_file+' --statsdb /tmp/test/stats.db --mutation-list '+config_file
         subprocess.run(build_command.split(' '), cwd='/mutator')
         #cleanup
+        
         os.remove(config_file)
+        releaseLock(lock_fd)
 
 
 def main():
@@ -113,6 +122,8 @@ def main():
             continue
         all_ids.append(int(id_entry))
 
+    #TODO: JUST FOR TESTING, REMOVE THE FOLLOWING LINE!!!
+    all_ids = all_ids[:20]
 
     # build mutants
     pool = Pool(POOL_SIZE)
