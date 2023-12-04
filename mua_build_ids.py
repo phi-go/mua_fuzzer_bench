@@ -122,8 +122,8 @@ def main():
             continue
         all_ids.append(int(id_entry))
 
-    #TODO: JUST FOR TESTING, REMOVE THE FOLLOWING LINE!!!
-    all_ids = all_ids[:20]
+    #TODO: JUST FOR TESTING: UNCOMMENT THE FOLLOWING LINE!!!
+    #all_ids = all_ids[:20]
 
     # build mutants
     pool = Pool(POOL_SIZE)
