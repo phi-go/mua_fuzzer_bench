@@ -22,24 +22,31 @@ def extract_bc(executable_path: Path):
 
 
 def extract_args(args):
+    exception_args = []
     kept_args = []
 
     for arg in args:
         if not arg.startswith('-'):
             continue
 
+        # Keep these arguments
         if any(arg.startswith(ss) for ss in [
-            "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib"
+            "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib",
+            "-std", "-L"
         ]):
             kept_args.append({'val': arg, 'action': None})
 
+        # Ignore these arguments
         elif any(arg.startswith(ss) for ss in [
             "-O", "-o", "-fprofile-instr-generate", "-fcoverage-mapping",
         ]):
             continue
 
         else:
-            raise Exception(f"Unknown arg type: {arg} in {args}")
+            exception_args.append(arg)
+
+    if len(exception_args) > 0:
+        raise Exception(f"Unhandled args: {exception_args} in {args}")
 
     return kept_args
 
