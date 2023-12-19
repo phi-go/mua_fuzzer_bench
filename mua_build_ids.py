@@ -87,7 +87,7 @@ def main():
     parser.add_argument('trial_num', metavar='N',
                     help='fuzzbench trial_num')
 
-    parser.add_argument('debug_num_mutants', metavar='D', required=False, type=int,
+    parser.add_argument('--debug_num_mutants', metavar='D', required=False, type=int,
                     help='For debugging purposes, limit the number of mutants to build.')
 
     args = parser.parse_args()
