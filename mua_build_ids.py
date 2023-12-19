@@ -87,12 +87,16 @@ def main():
     parser.add_argument('trial_num', metavar='N',
                     help='fuzzbench trial_num')
 
+    parser.add_argument('debug_num_mutants', metavar='D', required=False, type=int,
+                    help='For debugging purposes, limit the number of mutants to build.')
+
     args = parser.parse_args()
 
     fuzz_target = args.fuzz_target
     experiment = args.experiment
     fuzzer = args.fuzzer
     trial_num = str(args.trial_num)
+    debug_num_mutants = args.debug_num_mutants
 
     shared_mua_binaries_dir = '/tmp/experiment-data/'+experiment+'/mua-binaries/'
     corpus_dir = shared_mua_binaries_dir+'corpi/'+fuzzer+'/'+trial_num+'/'
@@ -122,8 +126,8 @@ def main():
             continue
         all_ids.append(int(id_entry))
 
-    #TODO: JUST FOR TESTING: UNCOMMENT THE FOLLOWING LINE!!!
-    #all_ids = all_ids[:20]
+    if debug_num_mutants is not None:
+        all_ids = all_ids[:debug_num_mutants]
 
     # build mutants
     pool = Pool(POOL_SIZE)
