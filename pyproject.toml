@@ -35,6 +35,9 @@ Source = "https://github.com/unknown/mua-fuzzer-benchmark"
 [tool.hatch.version]
 path = "src/mua_fuzzer_benchmark/__about__.py"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/mua_fuzzer_benchmark"]
+
 [tool.hatch.envs.default]
 python="3.10"
 dependencies = [
