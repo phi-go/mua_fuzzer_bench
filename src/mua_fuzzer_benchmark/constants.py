@@ -43,7 +43,7 @@ USE_GATHERED_SEEDS = False
 CHECK_INTERVAL = 5
 
 # The path where eval data is stored outside of the docker container
-HOST_TMP_PATH = Path(".").resolve()/"tmp/"
+HOST_TMP_PATH = Path(os.getenv("MUT_HOST_TMP_PATH", Path(".").resolve()/"tmp/"))
 
 MUT_BC_SUFFIX = ".ll.mut.bc"
 MUT_LL_SUFFIX = ".ll.mut.ll"
