@@ -113,7 +113,7 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
         '--result-path',
         mutant_file,
         '--statsdb',
-        '/mua_build/stats.db',
+        '/mua_build/build/stats.db',
         '--mutation-list',
         config_file
     ]
