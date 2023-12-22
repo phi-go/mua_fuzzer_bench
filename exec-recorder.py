@@ -25,6 +25,7 @@ def main():
         raise Exception("MUA_RECORDING_DB environment variable not set.")
 
     RECORDING_DB = Path(RECORDING_DB)
+    RECORDING_DB.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = sys.argv
 
