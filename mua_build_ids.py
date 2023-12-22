@@ -14,7 +14,7 @@ import traceback
 import uuid
 
 
-MAPPED_DIR = Path('/tmp/experiment-data/')
+MAPPED_DIR = Path('/mapped/')
 LOCATOR_TIMEOUT = 30
 
 

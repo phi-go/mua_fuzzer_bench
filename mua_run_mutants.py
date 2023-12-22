@@ -11,7 +11,7 @@ import time
 import traceback
 import sqlite3
 
-MAPPED_DIR = Path('/tmp/experiment-data/')
+MAPPED_DIR = Path('/mapped/')
 RUN_TIMEOUT = 1
 RUN_CHUNK_SIZE = 100
 
@@ -188,7 +188,6 @@ def run_input(tmpdir, input_file, original_executable, mutant_executable):
 def run_inputs(tmpdir, original_executable, chunk):
     results = []
     for input_file, mutant_executable, mut_id in chunk:
-        print(input_file, mutant_executable, mut_id)
         results.append({
             'input_file': input_file,
             'mut_id': mut_id,
