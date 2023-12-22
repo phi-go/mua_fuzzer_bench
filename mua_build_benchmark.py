@@ -78,8 +78,8 @@ def main():
     print()
 
     FUZZER_LIB_STR = '/mutator/dockerfiles/programs/common/main.cc'
-    CONFIG_PATH = Path('/tmp/config.json')
-    recording_db = Path('/tmp/execs.sqlite')
+    CONFIG_PATH = Path('/mua_build/config.json')
+    recording_db = Path('/mua_build/execs.sqlite')
 
     assert recording_db.is_file(), f"Recording DB {recording_db} does not exist!"
 
@@ -136,16 +136,6 @@ def main():
 
     with open(CONFIG_PATH, 'wt') as f:
         json.dump(config, f, indent=4)
-
-    # Build locator for each bc
-    # pipx run hatch run --help
-
-    # cd /mutator && pipx run hatch src/mua_fuzzer_benchmark/eval.py locator_local --config-path /tmp/config.json
-    # clear && cd /mutator && gradle build && pipx run hatch run src/mua_fuzzer_benchmark/eval.py locator_local --config-path /tmp/config.json --result-path /tmp/test/
-
-    # /root/go/bin/gclang++ -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -pthread -Wl,--no-as-needed -Wl,-ldl -Wl,-lm -Wno-unused-command-line-argument -stdlib=libc++ -O3 -I../include /mutator/dockerfiles/programs/common/main.cc ../src/test_lib_json/fuzz.cpp -o /out/jsoncpp_fuzzer lib/libjsoncpp.a
-
-    # /usr/lib/llvm-15/bin/clang++ -fno-inline -O3 -v /out/jsoncpp_fuzzer.ll.opt_mutate.ll /mutator/dockerfiles/programs/common/main.cc -L/mutator/build/install/LLVM_Mutation_Tool/lib -lm -lz -ldl -ldynamiclibrary -o /out/jsoncpp_fuzzer.ll.opt_mutate
 
 
 if __name__ == "__main__":

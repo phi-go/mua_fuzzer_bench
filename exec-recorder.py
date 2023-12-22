@@ -18,7 +18,7 @@ def main():
     cur_time = time.time()
 
     if DEBUG:
-        with open("/tmp/exec-recorder-errors.txt", "at") as f:
+        with open("/mua_build/exec-recorder-errors.txt", "at") as f:
             f.write(f"logging to {RECORDING_DB}\n")
 
     if RECORDING_DB is None:
@@ -55,7 +55,7 @@ def main():
         c.close()
 
     if True:
-        with open("/tmp/exec-recorder-errors.txt", "at") as f:
+        with open("/mua_build/exec-recorder-errors.txt", "at") as f:
             f.write(f"logged {cur_time} {cmd_json[:20]} {env_json[:20]}\n")
 
     os.execl(cmd[0], *cmd)
@@ -66,6 +66,6 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
-        with open("/tmp/exec-recorder-errors.txt", "at") as f:
+        with open("/mua_build/exec-recorder-errors.txt", "at") as f:
             f.write(f"{traceback.format_exc()}\n")
         raise e
