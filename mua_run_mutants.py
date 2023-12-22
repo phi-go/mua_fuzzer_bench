@@ -11,9 +11,9 @@ import time
 import traceback
 import sqlite3
 
-# POOL_SIZE = 10
 MAPPED_DIR = Path('/tmp/experiment-data/')
-RUN_TIMEOUT = 2
+RUN_TIMEOUT = 1
+RUN_CHUNK_SIZE = 100
 
 class ResultDB:
     def __init__(self, db_file):
@@ -31,6 +31,8 @@ class ResultDB:
                 PRIMARY KEY (input_file, mut_id)
             )
         ''')
+        cur.execute('PRAGMA journal_mode=WAL')
+        cur.execute('PRAGMA synchronous=NORMAL')
         self.conn.commit()
 
     def print_all_results(self):
@@ -121,55 +123,58 @@ class ResultDB:
         ''', (input_file, mut_id, True, None, None, None))
         self.conn.commit()
 
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
 def run(  # type: ignore[misc]
-        raise_on_error: bool,
         cmd,
-        timeout = None,
+        timeout,
         **kwargs,
 ):
     """
     Run command locally.
     If return_code is not 0, raise a ValueError containing the run result.
     """
+    start_time = time.time()
     timed_out = False
     with subprocess.Popen(cmd,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        close_fds=True,
-        errors='backslashreplace',  # text mode: stdout is a str
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        # close_fds=True,
+        # errors='backslashreplace',  # text mode: stdout is a str
         # preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
         **kwargs  # type: ignore[misc]
     ) as proc:
-        start_time = time.time()
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            stdout, _ = proc.communicate(timeout=10)
             timed_out = True
-        except Exception:
+            stdout, _ = proc.communicate(timeout=1)
+        except:
             proc.kill()
-            proc.wait()
-            raise
+            stdout, _ = proc.communicate(timeout=1)
 
         returncode = proc.poll()
         runtime = time.time() - start_time
 
-        assert isinstance(returncode, int)
-        if raise_on_error and returncode != 0:
-            msg = f"exec error: {str(proc.args)}\nreturncode: {returncode}\n{stdout}"
-            print(msg)
-            raise ValueError(msg)
+        return {
+            'returncode': returncode,
+            'out': stdout.decode('utf-8', 'backslashreplace'),
+            'timed_out': timed_out,
+            'runtime': runtime
+        }
 
-        return {'returncode': returncode, 'out': stdout, 'timed_out': timed_out, 'runtime': runtime}
 
-
-def run_input(input_file, original_executable, mutant_executable):
+def run_input(tmpdir, input_file, original_executable, mutant_executable):
     # execute input_file on original executable
-    with tempfile.TemporaryDirectory() as tmpdir:
-        original_result = run(False, [original_executable, input_file], timeout=RUN_TIMEOUT, cwd=tmpdir)
+    original_result = run([original_executable, input_file], timeout=RUN_TIMEOUT, cwd=tmpdir)
     # execute input_file on mutant executable
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mutant_result = run(False, [mutant_executable, input_file], timeout=RUN_TIMEOUT, cwd=tmpdir)
+    mutant_result = run([mutant_executable, input_file], timeout=RUN_TIMEOUT, cwd=tmpdir)
     # compare results
     # if results differ, add mutant to killed_mutants
     # else add mutant to surviving_mutants
@@ -178,6 +183,18 @@ def run_input(input_file, original_executable, mutant_executable):
         'original_result': original_result,
         'mutant_result': mutant_result,
     }
+
+# input_file, original_executable, mutant_executable 
+def run_inputs(tmpdir, original_executable, chunk):
+    results = []
+    for input_file, mutant_executable, mut_id in chunk:
+        print(input_file, mutant_executable, mut_id)
+        results.append({
+            'input_file': input_file,
+            'mut_id': mut_id,
+            'result': run_input(tmpdir, input_file, original_executable, mutant_executable),
+        })
+    return results
 
 
 def main():
@@ -276,31 +293,34 @@ def main():
     print(f"run jobs: {len(todo_run_jobs)}")
 
     # run mutants
-    run_jobs = {}
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        for input_file, mutant_executable, mut_id in todo_run_jobs:
-            run_jobs[executor.submit(
-                run_input, input_file, original_executable, mutant_executable
-            )] = (input_file,  mut_id)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_jobs = []
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            for chunk in chunks(todo_run_jobs, RUN_CHUNK_SIZE):
+                run_jobs.append(executor.submit(
+                    run_inputs, tmpdir, original_executable, chunk
+                ))
 
-    job_done_cnt = 0
-    for job in as_completed(run_jobs):
-        job_meta = run_jobs[job]
-        try:
-            res = job.result()
-        except Exception as e:
-            stacktrace = traceback.format_exc()
-            print(f"Error while running mutant: {e}:\n{stacktrace}")
-            continue
-        input_file, mut_id = job_meta
-        killed = res['killed']
-        orig_res = res['original_result']
-        mutant_res = res['mutant_result']
-        stats.update(["result"])
-        corpus_run_result_db.add_result(Path(input_file).name, mut_id, killed, orig_res, mutant_res)
-        job_done_cnt += 1
-        if job_done_cnt % 100 == 0:
-            print(f"Completed {job_done_cnt}/{len(todo_run_jobs)} run jobs")
+        job_done_cnt = 0
+        for job in run_jobs:
+            try:
+                res = job.result()
+            except Exception as e:
+                stacktrace = traceback.format_exc()
+                print(f"Error while running input chunk: {e}:\n{stacktrace}")
+                continue
+            for run_result in res:
+                input_file = run_result['input_file']
+                mut_id = run_result['mut_id']
+                exec_result = run_result['result']
+                killed = exec_result['killed']
+                orig_res = exec_result['original_result']
+                mutant_res = exec_result['mutant_result']
+                stats.update(["result"])
+                corpus_run_result_db.add_result(Path(input_file).name, mut_id, killed, orig_res, mutant_res)
+                job_done_cnt += 1
+                if job_done_cnt % 1000 == 0:
+                    print(f"Completed {job_done_cnt}/{len(todo_run_jobs)} run jobs")
 
     print(f"mua run stats:")
     for msg, cnt in stats.most_common():
