@@ -224,7 +224,7 @@ def main():
     trial_num = str(args.trial_num)
     original_executable = Path(os.environ['OUT']) / fuzz_target
 
-    shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-binaries'
+    shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
     corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / fuzzer / trial_num
     corpus_run_results = shared_mua_binaries_dir / 'corpus_run_results' / fuzzer / trial_num

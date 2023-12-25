@@ -223,7 +223,7 @@ def main():
     trial_num = str(args.trial_num)
     debug_num_mutants = args.debug_num_mutants
 
-    shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-binaries'
+    shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
     corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / fuzzer / trial_num
 
