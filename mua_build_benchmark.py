@@ -23,24 +23,8 @@ def extract_bc(executable_path: Path, workdir: str = None, outdir: str = None):
     getbc_workdir_error = None
     getbc_outdir_error = None
     try:
-        subprocess.check_call(
+        subprocess.check_output(
             ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            errors='backslashreplace',
-            cwd=workdir,
-        )
-        return cwd_path(bc_path, workdir)
-    except subprocess.CalledProcessError as e:
-        error = f"get-bc workdir (workdir: {workdir}) failed\n"
-        error += f"get-bc workdir failed: {e}\n"
-        error += f"get-bc workdir stdout: {e.stdout}\n"
-        error += f"get-bc workdir stderr: {e.stderr}"
-        getbc_workdir_error = error
-    try:
-        subprocess.check_call(
-            ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
-            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             errors='backslashreplace',
             cwd=outdir,
@@ -52,6 +36,20 @@ def extract_bc(executable_path: Path, workdir: str = None, outdir: str = None):
         error += f"get-bc outdir stdout: {e.stdout}\n"
         error += f"get-bc outdir stderr: {e.stderr}"
         getbc_outdir_error = error
+    try:
+        subprocess.check_output(
+            ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
+            stderr=subprocess.STDOUT,
+            errors='backslashreplace',
+            cwd=workdir,
+        )
+        return cwd_path(bc_path, workdir)
+    except subprocess.CalledProcessError as e:
+        error = f"get-bc workdir (workdir: {workdir}) failed\n"
+        error += f"get-bc workdir failed: {e}\n"
+        error += f"get-bc workdir stdout: {e.stdout}\n"
+        error += f"get-bc workdir stderr: {e.stderr}"
+        getbc_workdir_error = error
 
     raise Exception(
         f"Failed to extract bitcode from {executable_path}\n" +
@@ -73,13 +71,14 @@ def extract_args(args):
         # Keep these arguments
         if any(arg.startswith(ss) for ss in [
             "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib",
-            "-std", "-L", "-g", "-fdiagnostics-color"
+            "-std", "-L", "-fdiagnostics-color"
         ]):
             kept_args.append({'val': arg, 'action': None})
 
         # Ignore these arguments
         elif any(arg.startswith(ss) for ss in [
             "-O", "-o", "-fprofile-instr-generate", "-fcoverage-mapping",
+            "-g",
         ]):
             continue
 
@@ -116,6 +115,8 @@ def main():
     print(f"BENCHMARK: {benchmark}")
     fuzzer = os.getenv('FUZZER')
     print(f"FUZZER: {fuzzer}")
+    fuzz_target = os.getenv('FUZZ_TARGET')
+    print(f"FUZZ_TARGET: {fuzz_target}")
     print()
 
     FUZZER_LIB_STR = '/mutator/dockerfiles/programs/common/main.cc'
@@ -142,6 +143,11 @@ def main():
                 candidates.append((cmd, env, executable_path))
     executables = []
     for cmd, env, executable_path in candidates:
+        if fuzz_target is not None:
+            if fuzz_target != executable_path.name:
+                print(f"Skipping candidate executable ({executable_path}) " +
+                      f"because it does not match FUZZ_TARGET: {fuzz_target}")
+                continue
         print(f"Checking candidate executable: {executable_path}")
         print(f"cmd: {cmd}")
         print(f"env: {env}")
