@@ -6,19 +6,60 @@ from pathlib import Path
 from pprint import pprint
 import sqlite3
 import subprocess
+from typing import Optional
 
 
-def extract_bc(executable_path: Path):
-    assert executable_path.is_file(), f"Executable {executable_path} does not exist!"
-    print(f"Extracting bitcode from {executable_path}")
+def cwd_path(path: Path, cwd: Optional[Path] = None):
+    current_dir = Path.cwd()
+    if cwd is None:
+        return (current_dir / path).absolute()
+    else:
+        return (cwd / path).absolute()
+
+
+def extract_bc(executable_path: Path, workdir: str = None, outdir: str = None):
+    print(f"Trying to extracting bitcode from {executable_path}")
     bc_path = executable_path.with_suffix('.bc')
-    subprocess.check_call(
-         ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
-         stdout=subprocess.PIPE,
-         stderr=subprocess.STDOUT,
-         errors='backslashreplace')
+    getbc_workdir_error = None
+    getbc_outdir_error = None
+    try:
+        subprocess.check_call(
+            ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            errors='backslashreplace',
+            cwd=workdir,
+        )
+        return cwd_path(bc_path, workdir)
+    except subprocess.CalledProcessError as e:
+        error = f"get-bc workdir (workdir: {workdir}) failed\n"
+        error += f"get-bc workdir failed: {e}\n"
+        error += f"get-bc workdir stdout: {e.stdout}\n"
+        error += f"get-bc workdir stderr: {e.stderr}"
+        getbc_workdir_error = error
+    try:
+        subprocess.check_call(
+            ['get-bc', '-S', '-v', '-o', str(bc_path), str(executable_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            errors='backslashreplace',
+            cwd=outdir,
+        )
+        return cwd_path(bc_path, outdir)
+    except subprocess.CalledProcessError as e:
+        error = f"get-bc outdir (OUT: {outdir}) failed\n"
+        error += f"get-bc outdir failed: {e}\n"
+        error += f"get-bc outdir stdout: {e.stdout}\n"
+        error += f"get-bc outdir stderr: {e.stderr}"
+        getbc_outdir_error = error
 
-    return bc_path
+    raise Exception(
+        f"Failed to extract bitcode from {executable_path}\n" +
+        f"{getbc_workdir_error}\n" +
+        f"{getbc_outdir_error}"
+    )
+        
+
 
 
 def extract_args(args):
@@ -32,7 +73,7 @@ def extract_args(args):
         # Keep these arguments
         if any(arg.startswith(ss) for ss in [
             "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib",
-            "-std", "-L"
+            "-std", "-L", "-g", "-fdiagnostics-color"
         ]):
             kept_args.append({'val': arg, 'action': None})
 
@@ -90,7 +131,7 @@ def main():
         for row in c:
             cmds.append(row)
 
-    executables = []
+    candidates = []
     for _time, cmd_str, env_str in cmds:
             cmd = json.loads(cmd_str)
             env = json.loads(env_str)
@@ -98,9 +139,15 @@ def main():
                 o_args_idx = cmd.index('-o')
                 executable_path = Path(cmd[o_args_idx + 1])
                 print(f"Found candidate executable: {executable_path}")
-                bc_path = extract_bc(executable_path)
-                print(f"Extracted bitcode to {bc_path}")
-                executables.append((cmd, env, bc_path))
+                candidates.append((cmd, env, executable_path))
+    executables = []
+    for cmd, env, executable_path in candidates:
+        print(f"Checking candidate executable: {executable_path}")
+        print(f"cmd: {cmd}")
+        print(f"env: {env}")
+        bc_path = extract_bc(executable_path, env.get('PWD', None), out)
+        print(f"Extracted bitcode to {bc_path}")
+        executables.append((cmd, env, bc_path))
 
     assert len(executables) > 0, "No bitcode files found!"
 
