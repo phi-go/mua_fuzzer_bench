@@ -56,38 +56,79 @@ def extract_bc(executable_path: Path, workdir: str = None, outdir: str = None):
         f"{getbc_workdir_error}\n" +
         f"{getbc_outdir_error}"
     )
-        
 
+
+def is_full_arg(arg, arg_candidates):
+    for arg_candidate in arg_candidates:
+        if arg.startswith(arg_candidate):
+            return len(arg) > len(arg_candidate)
+    raise Exception(f"Just matched the arg: {arg} now not in arg_candidates: {arg_candidates}")
+
+
+KEEP_VALUE_ARGS = [
+    "-D", "-I", "-W", "-l", "-L", "-std", "-fno-", 
+]
+
+KEEP_SINGLE_ARGS = [
+    "-fPIE", "-pthread",
+    "-stdlib", "-fdiagnostics-color"
+]
+
+IGNORE_VALUE_ARGS = [
+    "-O", "-o", "-g",
+]
+
+IGNORE_SINGLE_ARGS = [
+    "-fprofile-instr-generate", "-fcoverage-mapping",
+]
 
 
 def extract_args(args):
+    print("extracting args:")
+    pprint(args)
     exception_args = []
     kept_args = []
 
-    for arg in args:
-        if not arg.startswith('-'):
-            continue
+    ii = 0
+    while ii < len(args):
+        arg = args[ii]
 
-        # Keep these arguments
-        if any(arg.startswith(ss) for ss in [
-            "-l", "-D", "-I", "-W", "-fno-", "-fPIE", "-pthread", "-stdlib",
-            "-std", "-L", "-fdiagnostics-color"
-        ]):
+        # No need to keep file args
+        if not arg.startswith('-'):
+            pass
+
+        # Keep these value arguments
+        elif any(arg.startswith(ss) for ss in KEEP_VALUE_ARGS):
+            kept_args.append({'val': arg, 'action': None})
+            if not is_full_arg(arg, KEEP_VALUE_ARGS):
+                ii += 1
+                arg = args[ii]
+                kept_args.append({'val': arg, 'action': None})
+
+        # Keep these single arguments
+        elif any(arg.startswith(ss) for ss in KEEP_SINGLE_ARGS):
             kept_args.append({'val': arg, 'action': None})
 
-        # Ignore these arguments
-        elif any(arg.startswith(ss) for ss in [
-            "-O", "-o", "-fprofile-instr-generate", "-fcoverage-mapping",
-            "-g",
-        ]):
-            continue
+        # Ignore these value arguments
+        elif any(arg.startswith(ss) for ss in IGNORE_VALUE_ARGS):
+            if not is_full_arg(arg, IGNORE_VALUE_ARGS):
+                ii += 1
+            pass
+        # Ignore these single arguments
+        elif any(arg.startswith(ss) for ss in IGNORE_SINGLE_ARGS):
+            pass
 
+        # Unknown argument
         else:
             exception_args.append(arg)
+
+        ii += 1
 
     if len(exception_args) > 0:
         raise Exception(f"Unhandled args: {exception_args} in {args}")
 
+    print("extracted args:")
+    pprint(kept_args)
     return kept_args
 
 
