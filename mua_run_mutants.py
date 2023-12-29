@@ -157,12 +157,6 @@ def run(  # type: ignore[misc]
             timed_out = True
             stdout, _ = proc.communicate(timeout=1)
         except PermissionError:
-            for pp in reversed(Path(cmd[0]).parents):
-                res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
-                extra += f"ls -la {pp}:\n{res.stdout}"
-            for pp in reversed(Path(cmd[1]).parents):
-                res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
-                extra += f"ls -la {pp}:\n{res.stdout}"
             proc.kill()
             stdout, _ = proc.communicate(timeout=1)
         except:
@@ -297,6 +291,13 @@ def main():
                 # print(f"mutant file {mutant_executable} does not exist")  # TODO this is noisy for debug
                 stats.update(["no_mutant_executable"])
                 continue
+            if len(todo_run_jobs) == 0:
+                for pp in reversed(Path(mutant_executable).parents):
+                    res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
+                    extra += f"ls -la {pp}:\n{res.stdout}"
+                for pp in reversed(Path(input_file).parents):
+                    res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
+                    extra += f"ls -la {pp}:\n{res.stdout}"
             todo_run_jobs.append((input_file, mutant_executable, mut_id))
 
 
