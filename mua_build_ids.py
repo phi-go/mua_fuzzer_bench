@@ -270,8 +270,6 @@ def main():
             if not (timed_out or errored_out):
                 successful_count += 1
         completed_count += 1
-        if completed_count % 100 == 0:
-            print(f"Completed {completed_count}/{corpus_len} corpus entries in {time.time() - locate_start_time:.2f}s, {successful_count} successful, {timeout_count} timed out, {errored_count} errored out", flush=True)
 
     print(f"Locator: All completed for {fuzz_target} {experiment} {fuzzer} {trial_num}: {completed_count}/{corpus_len} corpus entries in {time.time() - locate_start_time:.2f}s. New results: {successful_count} successful, {timeout_count} timed out, {errored_count} errored out.")
 

@@ -9,6 +9,6 @@ print("Entering mua_idle.py")
 if(os.path.isfile(run_before_file)):
     while(True):
         print("IDLE IDLE IDLE")
-        time.sleep(1)
+        time.sleep(1000)
 fp = open(run_before_file, 'x')
 fp.close()

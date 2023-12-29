@@ -141,6 +141,7 @@ def run(  # type: ignore[misc]
     """
     start_time = time.time()
     timed_out = False
+    extra = ''
     with subprocess.Popen(cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -155,6 +156,15 @@ def run(  # type: ignore[misc]
             proc.kill()
             timed_out = True
             stdout, _ = proc.communicate(timeout=1)
+        except PermissionError:
+            for pp in reversed(Path(cmd[0]).parents):
+                res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
+                extra += f"ls -la {pp}:\n{res.stdout}"
+            for pp in reversed(Path(cmd[1]).parents):
+                res = subprocess.run(['ls', '-la', str(pp)], capture_output=True, text=True, stderr=subprocess.STDOUT)
+                extra += f"ls -la {pp}:\n{res.stdout}"
+            proc.kill()
+            stdout, _ = proc.communicate(timeout=1)
         except:
             proc.kill()
             stdout, _ = proc.communicate(timeout=1)
@@ -166,7 +176,8 @@ def run(  # type: ignore[misc]
             'returncode': returncode,
             'out': stdout.decode('utf-8', 'backslashreplace'),
             'timed_out': timed_out,
-            'runtime': runtime
+            'runtime': runtime,
+            'extra': extra,
         }
 
 
@@ -300,7 +311,6 @@ def main():
                     run_inputs, tmpdir, original_executable, chunk
                 ))
 
-        job_done_cnt = 0
         for job in run_jobs:
             try:
                 res = job.result()
@@ -317,9 +327,6 @@ def main():
                 mutant_res = exec_result['mutant_result']
                 stats.update(["result"])
                 corpus_run_result_db.add_result(Path(input_file).name, mut_id, killed, orig_res, mutant_res)
-                job_done_cnt += 1
-                if job_done_cnt % 1000 == 0:
-                    print(f"Completed {job_done_cnt}/{len(todo_run_jobs)} run jobs")
 
     print(f"mua run stats:")
     for msg, cnt in stats.most_common():
