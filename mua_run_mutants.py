@@ -295,11 +295,11 @@ def main():
                 for pp in reversed(Path(mutant_executable).parents):
                     res = subprocess.run(['ls', '-la', str(pp)],
                                          text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    extra += f"ls -la {pp}:\n{res.stdout}"
+                    print(f"ls -la {pp}:\n{res.stdout}")
                 for pp in reversed(Path(input_file).parents):
                     res = subprocess.run(['ls', '-la', str(pp)],
                                          text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    extra += f"ls -la {pp}:\n{res.stdout}"
+                    print(f"ls -la {pp}:\n{res.stdout}")
             todo_run_jobs.append((input_file, mutant_executable, mut_id))
 
 
