@@ -141,7 +141,6 @@ def run(  # type: ignore[misc]
     """
     start_time = time.time()
     timed_out = False
-    extra = ''
     with subprocess.Popen(cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -171,7 +170,6 @@ def run(  # type: ignore[misc]
             'out': stdout.decode('utf-8', 'backslashreplace'),
             'timed_out': timed_out,
             'runtime': runtime,
-            'extra': extra,
         }
 
 
@@ -291,15 +289,6 @@ def main():
                 # print(f"mutant file {mutant_executable} does not exist")  # TODO this is noisy for debug
                 stats.update(["no_mutant_executable"])
                 continue
-            if len(todo_run_jobs) == 0:
-                for pp in reversed(Path(mutant_executable).parents):
-                    res = subprocess.run(['ls', '-la', str(pp)],
-                                         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    print(f"ls -la {pp}:\n{res.stdout}")
-                for pp in reversed(Path(input_file).parents):
-                    res = subprocess.run(['ls', '-la', str(pp)],
-                                         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    print(f"ls -la {pp}:\n{res.stdout}")
             todo_run_jobs.append((input_file, mutant_executable, mut_id))
 
 
