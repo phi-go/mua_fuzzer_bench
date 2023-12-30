@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import os, argparse, random, subprocess, json
@@ -27,59 +28,137 @@ class CompilationStatus:
 class CompileDB:
     def __init__(self, db_file):
         self.db_file = db_file
-        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+
+    @contextmanager
+    def connect(self):
+        with sqlite3.connect(self.db_file, check_same_thread=False, timeout=300) as conn:
+            yield conn
 
     def initialize(self):
         print(f"Initializing compile db {self.db_file}")
-        cur = self.conn.cursor()
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS compilations (
-                mut_id INTEGER PRIMARY KEY,
-                exec_id BLOB,
-                done INTEGER
-            )
-        ''')
-        cur.execute('PRAGMA journal_mode=WAL')
-        cur.execute('PRAGMA synchronous=NORMAL')
-        self.conn.commit()
+        with self.connect() as conn:
+            cur = conn.cursor()
+            # cur.execute('PRAGMA journal_mode=WAL')
+            cur.execute('PRAGMA synchronous=FULL')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS compilations (
+                    exec_id BLOB,
+                    fuzz_target TEXT,
+                    mut_id INTEGER,
+                    done INTEGER,
+                    PRIMARY KEY (exec_id, fuzz_target, mut_id)
+                )
+            ''')
+                        
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_compilations_fuzz_target ON compilations
+                        (fuzz_target, mut_id, exec_id, done)
+            ''')
+            
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_exec_id_done ON compilations
+                        (exec_id, done)
+            ''')
+            conn.commit()
 
-    def get_compilation_status(self, mut_id):
-        cur = self.conn.cursor()
-        cur.execute('SELECT exec_id, done FROM compilations WHERE mut_id=?', (mut_id,))
-        res = cur.fetchall()
+    def get_compilation_status(self, fuzz_target, mut_id):
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT exec_id, done FROM compilations WHERE fuzz_target=? AND mut_id=?', (fuzz_target, mut_id))
+            res = cur.fetchall()
         all = []
         for r in res:
             all.append(CompilationStatus(r[0], r[1]))
         return all
 
-    def get_num_compiled(self, exec_id):
-        cur = self.conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM compilations WHERE done=1 or exec_id=?', (exec_id,))
-        return cur.fetchone()[0]
+    def get_num_compiled(self, fuzz_target, exec_id):
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT COUNT(*) FROM compilations WHERE done=1 AND fuzz_target=? or exec_id=? AND fuzz_target=?',
+                (fuzz_target, exec_id, fuzz_target))
+            return cur.fetchone()[0]
 
-    def set_started_building(self, mut_id, exec_id):
-        cur = self.conn.cursor()
-        cur.execute('INSERT INTO compilations (mut_id, exec_id, done) VALUES (?, ?, 0)', (mut_id, exec_id))
-        self.conn.commit()
+    def try_set_started_building(self, fuzz_target, mut_id, exec_id, max_num_compiling):
+        def is_compiled(cur, fuzz_target, mut_id):
+            cur.execute(
+                'SELECT exec_id, done FROM compilations WHERE fuzz_target=? AND mut_id=?', (fuzz_target, mut_id))
+            res = cur.fetchall()
+            all = []
+            for r in res:
+                all.append(CompilationStatus(r[0], r[1]))
+            for cs in all:
+                if cs.done is True:
+                    # mutant is already compiled
+                    return True
+                if cs.exec_id == exec_id:
+                    # already compiling
+                    return True
+            return False
 
-    def set_finished_building(self, mut_id):
-        cur = self.conn.cursor()
-        cur.execute('UPDATE compilations SET done=1 WHERE mut_id=?', (mut_id,))
-        self.conn.commit()
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute('BEGIN EXCLUSIVE TRANSACTION')
+
+            cur.execute(
+                'SELECT COUNT(*) FROM compilations WHERE exec_id=? AND done=0',
+                (exec_id,))
+            cur_compiling = cur.fetchone()[0]
+            if cur_compiling < max_num_compiling:
+
+                if is_compiled(cur, fuzz_target, mut_id):
+                    cur.execute('ROLLBACK TRANSACTION')
+                    return "done"
+
+                cur.execute('INSERT INTO compilations (fuzz_target, mut_id, exec_id, done) VALUES (?, ?, ?, 0)',
+                            (fuzz_target, mut_id, exec_id))
+                conn.execute('COMMIT TRANSACTION')
+                return "go"
+            else:
+                cur.execute('ROLLBACK TRANSACTION')
+                return "later"
+
+    def set_finished_building(self, fuzz_target, mut_id, exec_id):
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute('UPDATE compilations SET done=1 WHERE fuzz_target=? AND mut_id=? AND exec_id=?',
+                        (fuzz_target, mut_id, exec_id))
+            conn.commit()
 
 
-def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants):
+def estimate_max_num_compiling():
+    with open('/proc/meminfo') as file:
+        for line in file:
+            if 'MemTotal' in line:
+                mem_in_kb = line.split()[1]
+                break
+
+    usable_mem = 0.5 * int(mem_in_kb)
+    max_compilation_mem = 2 * 1000 * 1000 # ~2 GB
+    max_mem_concurrent = int(int(usable_mem) / max_compilation_mem)
+
+    # Get the number of cores
+    import multiprocessing
+    cpu_count = multiprocessing.cpu_count()
+    max_cpu_concurrent = cpu_count / 2
+    print(f"usable_mem: {usable_mem} kB, cpu_count: {cpu_count}")
+
+    return min(int(max_mem_concurrent), int(max_cpu_concurrent))
+
+
+def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling):
     compile_db = CompileDB(compile_db_path)
 
     if debug_num_mutants is not None:
-        num_compiled = compile_db.get_num_compiled(exec_id)
+        num_compiled = compile_db.get_num_compiled(fuzz_target, exec_id)
         if num_compiled >= debug_num_mutants:
             return
 
     mutant_file = mutants_dir/f'{mut_id}'
 
     # check if mutant is already compiled
-    compilation_status = compile_db.get_compilation_status(mut_id)
+    compilation_status = compile_db.get_compilation_status(fuzz_target, mut_id)
     for cs in compilation_status:
         if cs.done is True:
             print("mutant is already compiled")
@@ -90,7 +169,18 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
             return
 
     # mark mutant as being compiled
-    compile_db.set_started_building(mut_id, exec_id)
+    while True:
+        res = compile_db.try_set_started_building(fuzz_target, mut_id, exec_id, max_num_compiling)
+        if res == "go":
+            break
+        if res == "done":
+            return
+        if res == "later":
+            if debug_num_mutants is not None:
+                num_compiled = compile_db.get_num_compiled(fuzz_target, exec_id)
+                if num_compiled > debug_num_mutants:
+                    return
+            time.sleep(random.random() * 10)
 
     config_file = mutant_file.with_suffix(".json")
     
@@ -139,7 +229,7 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
             os.remove(config_file)
 
     # mark mutant as compiled
-    compile_db.set_finished_building(mut_id)
+    compile_db.set_finished_building(fuzz_target, mut_id, exec_id)
 
 
 def locate_corpus_entry(corpus_entry, locator_path, corpus_dir, mutants_ids_dir):
@@ -202,6 +292,9 @@ def main():
     parser.add_argument('fuzz_target', metavar='T',
                     help='fuzzbench fuzz_target')
 
+    parser.add_argument('benchmark', metavar='B',
+                    help='fuzzbench benchmark')
+
     parser.add_argument('experiment', metavar='E',
                     help='name of the fuzzbench experiment')
 
@@ -218,20 +311,24 @@ def main():
 
     exec_id = uuid.UUID(args.exec_id)
     fuzz_target = args.fuzz_target
+    benchmark = args.benchmark
     experiment = args.experiment
     fuzzer = args.fuzzer
     trial_num = str(args.trial_num)
     debug_num_mutants = args.debug_num_mutants
 
     shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
-    corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
-    mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / fuzzer / trial_num
-
     compile_db_path = shared_mua_binaries_dir / 'compile.sqlite'
-    mutants_dir = shared_mua_binaries_dir / 'mutants'
+    corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
+    mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / benchmark / fuzzer / trial_num
+    mutants_ids_dir.mkdir(parents=True, exist_ok=True)
+
+    mutants_dir = shared_mua_binaries_dir / 'mutants' / benchmark
+    mutants_dir.mkdir(parents=True, exist_ok=True)
     locator_path = (Path('/out') / fuzz_target).with_suffix('.locator')
 
-    print(f"mutants_ids_dir_entry: {mutants_ids_dir}")
+    max_num_compiling = estimate_max_num_compiling()
+    print(f"Estimating maximum number of concurrent compilations: {max_num_compiling}")
 
     compile_db = CompileDB(compile_db_path)
     compile_db.initialize()
@@ -244,8 +341,8 @@ def main():
     corpus_list = os.listdir(corpus_dir)
     corpus_len = len(corpus_list)
     locate_jobs = []
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        for ii, corpus_entry in enumerate(corpus_list):
+    with ThreadPoolExecutor(max_workers=max_num_compiling) as executor:
+        for corpus_entry in corpus_list:
             locate_jobs.append(executor.submit(
                 locate_corpus_entry, corpus_entry, locator_path, corpus_dir, mutants_ids_dir))
 
@@ -272,6 +369,7 @@ def main():
         completed_count += 1
 
     print(f"Locator: All completed for {fuzz_target} {experiment} {fuzzer} {trial_num}: {completed_count}/{corpus_len} corpus entries in {time.time() - locate_start_time:.2f}s. New results: {successful_count} successful, {timeout_count} timed out, {errored_count} errored out.")
+    print(f"Num of mutants covered: {len(all_mut_ids)}")
 
     exec_id_bytes = exec_id.bytes
 
@@ -284,9 +382,9 @@ def main():
 
     # build mutants
     build_jobs = []
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+    with ThreadPoolExecutor(max_workers=max_num_compiling) as executor:
         for mut_id in all_mut_ids:
-            build_jobs.append(executor.submit(build_mutant, mut_id, exec_id_bytes, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants))
+            build_jobs.append(executor.submit(build_mutant, mut_id, exec_id_bytes, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling))
 
     for job in as_completed(build_jobs):
         try:

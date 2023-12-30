@@ -208,6 +208,9 @@ def main():
     parser.add_argument('fuzz_target', metavar='T',
                     help='fuzzbench fuzz_target')
 
+    parser.add_argument('benchmark', metavar='B',
+                    help='fuzzbench fuzz_target')
+
     parser.add_argument('experiment', metavar='E',
                     help='name of the fuzzbench experiment')
 
@@ -222,6 +225,7 @@ def main():
     start_time = time.time()
 
     fuzz_target = args.fuzz_target
+    benchmark = args.benchmark
     experiment = args.experiment
     fuzzer = args.fuzzer
     trial_num = str(args.trial_num)
@@ -229,10 +233,10 @@ def main():
 
     shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
     corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
-    mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / fuzzer / trial_num
+    mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids'/ benchmark / fuzzer / trial_num
     corpus_run_results = shared_mua_binaries_dir / 'corpus_run_results' / fuzzer / trial_num
     corpus_run_result_db = ResultDB(corpus_run_results / f'results.sqlite')
-    mutants_dir = shared_mua_binaries_dir / 'mutants'
+    mutants_dir = shared_mua_binaries_dir / 'mutants' / benchmark
 
     print(f"original executable: {original_executable}")
     print(f"corpus dir: {corpus_dir.absolute()}")
