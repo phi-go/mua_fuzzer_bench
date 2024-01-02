@@ -71,7 +71,8 @@ KEEP_VALUE_ARGS = [
 
 KEEP_SINGLE_ARGS = [
     "-fPIE", "-pthread",
-    "-stdlib", "-fdiagnostics-color"
+    "-stdlib", "-fdiagnostics-color",
+    "-m64"
 ]
 
 IGNORE_VALUE_ARGS = [
@@ -160,7 +161,7 @@ def main():
     print(f"FUZZ_TARGET: {fuzz_target}")
     print()
 
-    FUZZER_LIB_STR = '/mutator/dockerfiles/programs/common/main.cc'
+    FUZZER_LIB_STR = ['/mutator/dockerfiles/programs/common/main.cc', f'/{fuzz_target}"']
     CONFIG_PATH = Path('/mua_build/config.json')
     recording_db = Path('/mua_build/execs.sqlite')
 
@@ -177,7 +178,7 @@ def main():
     for _time, cmd_str, env_str in cmds:
             cmd = json.loads(cmd_str)
             env = json.loads(env_str)
-            if  FUZZER_LIB_STR in cmd:
+            if any(x in cmd_str for x in FUZZER_LIB_STR):
                 o_args_idx = cmd.index('-o')
                 executable_path = Path(cmd[o_args_idx + 1])
                 print(f"Found candidate executable: {executable_path}")
