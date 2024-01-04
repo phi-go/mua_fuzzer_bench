@@ -161,7 +161,7 @@ def main():
     print(f"FUZZ_TARGET: {fuzz_target}")
     print()
 
-    FUZZER_LIB_STR = ['/mutator/dockerfiles/programs/common/main.cc', f'/{fuzz_target}"']
+    FUZZER_LIB_STR = ['/mutator/dockerfiles/programs/common/main.cc', f'/{fuzz_target}"', f'"-o", "{fuzz_target}"']
     CONFIG_PATH = Path('/mua_build/config.json')
     recording_db = Path('/mua_build/execs.sqlite')
 
