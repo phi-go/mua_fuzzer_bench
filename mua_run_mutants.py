@@ -3,10 +3,14 @@
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 import os, argparse, subprocess, json
+import random
 from pathlib import Path
 
 import tempfile
+import threading
+import multiprocessing
 import time
 import traceback
 import sqlite3
@@ -15,11 +19,23 @@ MAPPED_DIR = Path('/mapped/')
 RUN_TIMEOUT = 1
 ID_CHUNK_SIZE = 20
 RUN_CHUNK_SIZE = 1000
+MAX_RUNNER_RUNTIME = RUN_CHUNK_SIZE * RUN_TIMEOUT * 2
+
+@dataclass
+class RunInputResult:
+    killed: bool
+    orig_retcode: int
+    mutant_retcode: int
+    original_runtime: float
+    mutant_runtime: float
+    original_timed_out: bool
+    mutant_timed_out: bool
 
 class ResultDB:
-    def __init__(self, db_file):
+    def __init__(self, db_file, keep_running):
         self.db_file = db_file
         self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=300)
+        self.keep_running = keep_running
 
     @contextmanager
     def cur(self):
@@ -28,19 +44,38 @@ class ResultDB:
             yield cur
             cur.close()
 
+    @contextmanager
+    def immediate_transaction(self):
+        while self.keep_running.is_set():
+            try:
+                with self.cur() as cur:
+                    cur.execute('BEGIN IMMEDIATE TRANSACTION')
+                    yield cur
+                    return
+            except sqlite3.OperationalError as e:
+                if 'database is locked' in str(e):
+                    time.sleep(random.random() * 10)
+                else:
+                    raise
+        raise Exception("Could not begin transaction.")
+
     def initialize(self, benchmark, fuzz_target, fuzzer, trial_num):
         with self.cur() as cur:
             cur.execute('PRAGMA journal_mode=WAL')
             cur.execute('PRAGMA synchronous=NORMAL')
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS results (
-                    input_file TEXT,
+                    input_file_id INTEGER,
                     mut_id INTEGER,
                     skipped INTEGER,
                     killed INTEGER,
-                    orig_res TEXT,
-                    mutant_res TEXT,
-                    PRIMARY KEY (input_file, mut_id)
+                    orig_retcode INTEGER,
+                    mutant_retcode INTEGER,
+                    orig_runtime REAL,
+                    mutant_runtime REAL,
+                    orig_timed_out INTEGER,
+                    mutant_timed_out INTEGER,
+                    PRIMARY KEY (input_file_id, mut_id)
                 )
             ''')
             cur.execute('''
@@ -57,97 +92,86 @@ class ResultDB:
                         VALUES (?, ?, ?, ?)
             ''', (benchmark, fuzz_target, fuzzer, trial_num))
             cur.execute('''
-                CREATE INDEX IF NOT EXISTS idx_results ON results (input_file, mut_id, killed)
+                CREATE INDEX IF NOT EXISTS idx_results ON results (input_file_id, mut_id, killed)
             ''')
             cur.execute('''
                 CREATE INDEX IF NOT EXISTS idx_mut_is_kill ON results (mut_id, killed)
             ''')
             cur.execute('''COMMIT''')
 
-    def input_on_mut_is_done(self, input_file, mut_id, cur=None):
-        def _input_on_mut_is_done(cur):
-            cur.execute('''
-                SELECT 1 FROM results WHERE input_file = ? AND mut_id = ?
-                LIMIT 1
-            ''', (input_file, mut_id))
-            res = cur.fetchone()
-            return res is not None
-        if cur is None:
-            with self.cur() as cur:
-                return _input_on_mut_is_done(cur)
-        else:
-            return _input_on_mut_is_done(cur)
-    
-    def get_all_done(self):
+    def get_all_done_for_file(self, input_file_id):
         with self.cur() as cur:
             cur.execute('''
-                SELECT input_file, mut_id FROM results
-            ''')
-            res = cur.fetchall()
-        return set(hash((r[0],r[1])) for r in res)
-
-    def get_all_done_for_file(self, input_file):
-        with self.cur() as cur:
-            cur.execute('''
-                SELECT mut_id FROM results WHERE input_file = ?
-            ''', (input_file,))
+                SELECT mut_id FROM results WHERE input_file_id = ?
+            ''', (input_file_id,))
             res = cur.fetchall()
         return set(r[0] for r in res)
-
-    def mut_is_killed(self, mut_id):
-        with self.cur() as cur:
-            cur.execute('''
-                SELECT 1 FROM results WHERE mut_id = ? AND killed = 1
-                LIMIT 1
-            ''', (mut_id,))
-            res = cur.fetchone()
-        return res is not None
 
     def get_earliest_timestamp_killing_mutant(self, mut_id):
         with self.cur() as cur:
             cur.execute('''
                 SELECT timestamp FROM timestamps
-                JOIN results ON results.input_file = timestamps.hashname
+                JOIN results USING (input_file_id)
                 WHERE mut_id = ? AND killed = 1
                 ORDER BY timestamp
                 LIMIT 1
             ''', (mut_id,))
-            res = cur.fetchall()
-        if len(res) == 0:
+            res = cur.fetchone()
+        if res is None:
             return None
         else:
-            return res[0][0]
+            return res[0]
 
-    def get_timestamp_for_file(self, input_file):
+    def get_info_for_hashname(self, hashname):
         with self.cur() as cur:
             cur.execute('''
-                SELECT timestamp FROM timestamps WHERE hashname = ?
+                SELECT input_file_id, timestamp FROM timestamps WHERE hashname = ?
                 LIMIT 1
-            ''', (input_file,))
-            res = cur.fetchall()
-        if len(res) == 0:
+            ''', (hashname,))
+            res = cur.fetchone()
+        if res is None:
             return None
         else:
-            return res[0][0]
+            return res
 
     def add_all_results(self, results):
-        with self.cur() as cur:
-            cur.execute('''BEGIN IMMEDIATE TRANSACTION''')
-            for input_file, mut_id, killed, orig_res, mutant_res in results:
+        with self.immediate_transaction() as cur:
+            for input_file_id, mut_id, res in results:
                 cur.execute('''
-                    INSERT OR IGNORE INTO results (input_file, mut_id, skipped, killed, orig_res, mutant_res)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                ''', (input_file, mut_id, False, killed, json.dumps(orig_res), json.dumps(mutant_res)))
+                    INSERT OR IGNORE INTO results (
+                            input_file_id,
+                            mut_id,
+                            skipped,
+                            killed,
+                            orig_retcode,
+                            mutant_retcode,
+                            orig_runtime,
+                            mutant_runtime,
+                            orig_timed_out,
+                            mutant_timed_out
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    input_file_id,
+                    mut_id,
+                    False,
+                    res.killed,
+                    res.orig_retcode,
+                    res.mutant_retcode,
+                    res.original_runtime,
+                    res.mutant_runtime,
+                    res.original_timed_out,
+                    res.mutant_timed_out,
+                ))
             cur.execute('COMMIT TRANSACTION')
 
     def add_all_skipped(self, skipped):
-        with self.cur() as cur:
-            cur.execute('''BEGIN IMMEDIATE TRANSACTION''')
-            for input_file, mut_id in skipped:
+        with self.immediate_transaction() as cur:
+            for input_file_id, mut_id in skipped:
                 cur.execute('''
-                    INSERT OR IGNORE INTO results (input_file, mut_id, skipped, killed, orig_res, mutant_res)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                ''', (input_file, mut_id, True, None, None, None))
+                    INSERT OR IGNORE INTO results (input_file_id, mut_id, skipped)
+                        VALUES (?, ?, ?)
+                ''', (input_file_id, mut_id, True))
             cur.execute('COMMIT TRANSACTION')
 
 
@@ -211,36 +235,29 @@ def run_input(tmpdir, input_file, original_executable, mutant_executable):
     # compare results
     # if results differ, add mutant to killed_mutants
     # else add mutant to surviving_mutants
-    return {
-        'killed': original_result['returncode'] != mutant_result['returncode'],
-        'original_result': original_result,
-        'mutant_result': mutant_result,
-    }
+    return RunInputResult(
+        killed=original_result['returncode'] != mutant_result['returncode'],
+        orig_retcode=original_result['returncode'],
+        mutant_retcode=mutant_result['returncode'],
+        original_runtime=original_result['runtime'],
+        mutant_runtime=mutant_result['runtime'],
+        original_timed_out=original_result['timed_out'],
+        mutant_timed_out=mutant_result['timed_out'],
+    )
 
 
-def run_inputs(results_db, tmpdir, original_executable, mutants_dir, fuzz_target, chunk):
-    results_db = ResultDB(results_db)
+def run_inputs(results_db, tmpdir, original_executable, mutants_dir, fuzz_target, keep_running, chunk):
+    results_db = ResultDB(results_db, keep_running)
     result_counter = Counter()
-    skipped = []
     results = []
-    for input_file, mut_id in chunk:
-        # if results_db.input_on_mut_is_done(Path(input_file).name, mut_id):
-        #     result_counter["already_done"] += 1
-        #     continue
-        # if results_db.mut_is_killed(mut_id):
+    for input_file, input_file_id, mut_id in chunk:
         mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
         res = run_input(
             tmpdir, input_file, original_executable, mutant_executable)
-        killed = res['killed']
-        orig_res = res['original_result']
-        mutant_res = res['mutant_result']
-        results.append((Path(input_file).name, mut_id, killed, orig_res, mutant_res))
+        results.append((input_file_id, mut_id, res))
         result_counter["done"] += 1
 
-    results_db.add_all_skipped(skipped)
     results_db.add_all_results(results)
-        #             results_db.add_skipped(input_file, mut_id)
-        # results_db.add_result(Path(input_file).name, mut_id, killed, orig_res, mutant_res)
     return result_counter
 
 # for corpus entry in mutants_ids_dir run entry on each covered mutant
@@ -249,7 +266,8 @@ def run_inputs(results_db, tmpdir, original_executable, mutants_dir, fuzz_target
 def gather_run_jobs_chunk(
     corpus_mutant_id_files, corpus_dir, mutants_dir, fuzz_target, result_db_path
 ):
-    results_db = ResultDB(result_db_path)
+    keep_running = KEEP_RUNNING
+    results_db = ResultDB(result_db_path, keep_running)
     stats = Counter()
     todo_run_jobs = []
     skipped = []
@@ -273,12 +291,13 @@ def gather_run_jobs_chunk(
                 print(f"Error loading json file {corpus_mutant_ids_file}: {e}")
                 stats.update(["no_json"])
                 continue
-        file_timestamp = results_db.get_timestamp_for_file(input_file_name)
-        if file_timestamp is None:
+        hashname_info = results_db.get_info_for_hashname(input_file_name)
+        if hashname_info is None:
             stats.update(["(no_timestamp)"])
             continue
             # print(f"Could not find timestamp for input file: {input_file}")
-        all_done_for_file = results_db.get_all_done_for_file(input_file_name)
+        input_file_id, file_timestamp = hashname_info
+        all_done_for_file = results_db.get_all_done_for_file(input_file_id)
         for mut_id in input_mutant_ids:
             if mut_id in all_done_for_file:
                 # print(f"corpus input file {input_file} has already been run")
@@ -291,7 +310,7 @@ def gather_run_jobs_chunk(
                 earliest_kill_cache[mut_id] = earliest_kill
             if earliest_kill is not None:
                     if file_timestamp >= earliest_kill:
-                        skipped.append((input_file_name, mut_id))
+                        skipped.append((input_file_id, mut_id))
                         stats["skipped"] += 1
                         continue
             mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
@@ -299,7 +318,7 @@ def gather_run_jobs_chunk(
                 # print(f"mutant file {mutant_executable} does not exist")  # TODO this is noisy for debug
                 stats.update(["no_mutant_executable"])
                 continue
-            todo_run_jobs.append((input_file, mut_id))
+            todo_run_jobs.append((input_file, input_file_id, mut_id))
     return todo_run_jobs, stats, skipped
 
 
@@ -307,6 +326,11 @@ def split_list(lst, num_chunks):
     """Split the list |lst| into |num_chunks| chunks."""
     chunk_size = (len(lst) + num_chunks - 1) // num_chunks
     return chunks(lst, chunk_size)
+
+
+def keep_running_initializer(keep_running):
+    global KEEP_RUNNING
+    KEEP_RUNNING = keep_running
 
 
 def main():
@@ -346,7 +370,12 @@ def main():
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids'/ benchmark / fuzzer / trial_num
     corpus_run_results = shared_mua_binaries_dir / 'corpus_run_results' / fuzzer / trial_num
     result_db_path = corpus_run_results / f'results.sqlite'
-    results_db = ResultDB(result_db_path)
+
+    keep_running_runner = threading.Event()
+    keep_running_runner.set()
+    keep_running_gen = multiprocessing.Event()
+    keep_running_gen.set()
+    results_db = ResultDB(result_db_path, keep_running_runner)
     results_db.initialize(benchmark, fuzz_target, fuzzer, trial_num)
     mutants_dir = shared_mua_binaries_dir / 'mutants' / benchmark
 
@@ -362,6 +391,7 @@ def main():
     mutant_id_files = list(mutants_ids_dir.glob('*'))
     print(f"\t{len(mutant_id_files)=}")
     mutant_id_chunks = chunks(mutant_id_files, ID_CHUNK_SIZE)
+    stopping_thread = None
     
     # run mutants
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -370,7 +400,9 @@ def main():
         run_jobs = {}
         todo_list = []
         with ThreadPoolExecutor(max_workers=num_runner_threads) as runner_executor, \
-             ProcessPoolExecutor(max_workers=num_producer_processes) as gen_executor:
+             ProcessPoolExecutor(
+                 max_workers=num_producer_processes, initializer=keep_running_initializer, initargs=(keep_running_gen,)
+                 ) as gen_executor:
             while True:
                 while gen_count <= num_producer_processes * 2 \
                         and len(todo_list) < (RUN_CHUNK_SIZE * num_runner_threads):
@@ -380,16 +412,33 @@ def main():
                         break # all chunks submitted
                     gen_count += 1
                     run_jobs[gen_executor.submit(
-                        gather_run_jobs_chunk, mut_chunk, corpus_dir, mutants_dir, fuzz_target, result_db_path
+                        gather_run_jobs_chunk,
+                        mut_chunk, corpus_dir, mutants_dir, fuzz_target, result_db_path
                     )] = "gen"
 
                 if runner_count <= num_runner_threads:
-                    if len(todo_list) > RUN_CHUNK_SIZE or gen_count == 0 and len(todo_list) > 0:
+                    if (len(todo_list) > RUN_CHUNK_SIZE) or (gen_count == 0 and len(todo_list) > 0):
                         todo_chunk, todo_list = todo_list[:RUN_CHUNK_SIZE], todo_list[RUN_CHUNK_SIZE:]
                         run_jobs[runner_executor.submit(
-                            run_inputs, result_db_path, tmpdir, original_executable, mutants_dir, fuzz_target, todo_chunk
+                            run_inputs, result_db_path, tmpdir, original_executable, mutants_dir, fuzz_target, keep_running_runner, todo_chunk
                         )] = "run"
                         runner_count += 1
+                    elif gen_count == 0 and len(todo_list) == 0 and stopping_thread is None:
+                        # everything has been generated and all runners are started
+                        # start a thread that set keep_running to false when max runtime is reached
+                        def stop_running():
+                            start_time = time.time()
+                            while time.time() - start_time < MAX_RUNNER_RUNTIME:
+                                if not keep_running_runner.is_set():
+                                    return
+                                time.sleep(1)
+                            print(f"\tClearing keep_running")
+                            keep_running_gen.clear()
+                            keep_running_runner.clear()
+
+                        print(f"\tStarting stop_running thread")
+                        stopping_thread = threading.Thread(target=stop_running)
+                        stopping_thread.start()
 
                 try:
                     job = next(as_completed(run_jobs))
@@ -402,7 +451,7 @@ def main():
                     res = job.result()
                 except Exception as e:
                     stacktrace = traceback.format_exc()
-                    print(f"Error while running {job_meta}: {e}:\n{stacktrace}")
+                    print(f"Error during '{job_meta}' job: {e}:\n{stacktrace}")
                     continue
                 if job_meta == "gen":
                     gen_count -= 1
@@ -415,11 +464,14 @@ def main():
                     assert runner_count >= 0
                     stats.update(res)
 
-    print(f"\tmua run jobs time: {time.time() - run_jobs_start:0.2f}s")
+    keep_running_runner.clear()
+    if stopping_thread is not None:
+        print(f"\tWaiting for stopping_thread to finish")
+        stopping_thread.join()
     print(f"\tmua run stats:")
     for msg, cnt in stats.most_common():
         print(f"\t\t{msg}: {cnt}")
-    print(f"\tmua run time: {time.time() - start_time}")
+    print(f"\tmua run time: {time.time() - start_time:0.2f}s")
         
 
 if __name__ == "__main__":
