@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os, argparse, subprocess, json
+import shlex
 import random
 from pathlib import Path
 
@@ -18,8 +19,9 @@ import sqlite3
 MAPPED_DIR = Path('/mapped/')
 RUN_TIMEOUT = 1
 ID_CHUNK_SIZE = 20
-RUN_CHUNK_SIZE = 1000
+RUN_CHUNK_SIZE = 100
 MAX_RUNNER_RUNTIME = RUN_CHUNK_SIZE * RUN_TIMEOUT * 2
+MEM_LIMIT = 512 * 1024  # 512 MB
 
 @dataclass
 class RunInputResult:
@@ -192,12 +194,14 @@ def run(  # type: ignore[misc]
     """
     start_time = time.time()
     timed_out = False
-    with subprocess.Popen(cmd,
+    full_cmd = f'ulimit -v {MEM_LIMIT} ; exec {shlex.join((str(cc) for cc in cmd))}'
+    with subprocess.Popen(full_cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         # close_fds=True,
         # errors='backslashreplace',  # text mode: stdout is a str
         # preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
+        shell=True,
         **kwargs  # type: ignore[misc]
     ) as proc:
         try:
