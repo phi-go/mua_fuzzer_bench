@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
-from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import os, argparse, random, subprocess, json
+import shlex
 import sqlite3
 from pathlib import Path
-from multiprocessing import Pool
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -19,7 +19,11 @@ import multiprocessing
 MAPPED_DIR = Path('/mapped/')
 LOCATOR_TIMEOUT = 30
 MAX_BUILD_TIME = 5*60 # 5 minutes
+LOCATOR_MEM_LIMIT = 512 * 1024  # 512 MB
+BUILD_MEM_LIMIT = 2 * 1024 * 1024  # 2 GB
 
+BUILD_RES_OK = "compiled"
+BUILD_RES_ERR = "compile_error"
 
 @dataclass
 class CompilationStatus:
@@ -27,19 +31,149 @@ class CompilationStatus:
     done: bool
 
 
-class CompileDB:
-    def __init__(self, db_file):
+# CPU Management Begin
+class CpuDB:
+    def __init__(self, db_file, keep_running):
         self.db_file = db_file
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=300)
+        self.keep_running = keep_running
 
     @contextmanager
-    def connect(self):
-        with sqlite3.connect(self.db_file, check_same_thread=False, timeout=300) as conn:
-            yield conn
+    def cur(self):
+        with self.conn as conn:
+            cur = conn.cursor()
+            yield cur
+            cur.close()
+
+    @contextmanager
+    def transaction(self, transaction_type):
+        while self.keep_running.is_set():
+            try:
+                with self.cur() as cur:
+                    cur.execute(f'BEGIN {transaction_type} TRANSACTION')
+                    yield cur
+                    return
+            except sqlite3.OperationalError as e:
+                if 'database is locked' in str(e):
+                    time.sleep(random.random() * 10)
+                else:
+                    raise
+        raise Exception("Could not begin transaction.")
 
     def initialize(self):
         print(f"\tInitializing compile db {self.db_file}")
-        with self.connect() as conn:
+        with self.cur() as cur:
+            cur.execute('PRAGMA journal_mode=WAL')
+            cur.execute('PRAGMA synchronous=NORMAL')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS cpus (
+                    core INTEGER PRIMARY KEY,
+                    in_use INTEGER
+                )
+            ''')
+                        
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_cpus_used ON cpus
+                        (in_use, core)
+            ''')
+
+        with self.transaction('EXCLUSIVE') as cur:
+            cpu_count = multiprocessing.cpu_count()
+            for ii in range(cpu_count):
+                cur.execute('INSERT OR IGNORE INTO cpus (core, in_use) VALUES (?, 0)', (ii,))
+        
+    def get_free_cpu(self):
+        with self.transaction('EXCLUSIVE') as cur:
+            cur.execute('''
+                SELECT core FROM cpus WHERE in_use = 0
+                ORDER BY core ASC LIMIT 1
+            ''')
+            row = cur.fetchone()
+            if row:
+                cur.execute('UPDATE cpus SET in_use = 1 WHERE core = ?', (row[0],))
+                return row[0]
+            else:
+                return None
+
+    def release_cpu(self, core):
+        with self.transaction('IMMEDIATE') as cur:
+            cur.execute('UPDATE cpus SET in_use = 0 WHERE core = ?', (core,))
+
+
+def get_cpu_proc(cpu_db_path):
+    cpu_running: "multiprocessing.Event" = KEEP_RUNNING
+    keep_running = threading.Event()
+    keep_running.set()
+    cpu_db = CpuDB(cpu_db_path, keep_running)
+    while cpu_running.is_set():
+        new_cpu = cpu_db.get_free_cpu()
+        time.sleep(.1)
+        if new_cpu is not None:
+            return new_cpu
+        time.sleep(random.random() * 2)
+    return None
+
+
+def get_cpu(cpu_db_path, cpu_running, keep_running):
+    cpu_db = CpuDB(cpu_db_path, keep_running)
+    while cpu_running.is_set():
+        new_cpu = cpu_db.get_free_cpu()
+        time.sleep(.1)
+        if new_cpu is not None:
+            return new_cpu
+        time.sleep(random.random() * 2)
+    return None
+
+
+def stop_all_cpu_jobs(jobs, cpu_db):
+    # stop all get_cpu jobs
+    removed_jobs = []
+    for job in jobs:
+        if jobs[job][0] == "cpu":
+            if job.cancel():
+                removed_jobs.append(job)
+            else:
+                chosen_cpu = job.result()
+                print(f"\tImmediately releasing {chosen_cpu=}")
+                if chosen_cpu is not None:
+                    cpu_db.release_cpu(chosen_cpu)
+                removed_jobs.append(job)
+    for job in removed_jobs:
+        jobs.pop(job)
+# CPU Management End
+
+
+class CompileDB:
+    def __init__(self, db_file, keep_running):
+        self.db_file = db_file
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=300)
+        self.keep_running = keep_running
+
+    @contextmanager
+    def cur(self):
+        with self.conn as conn:
             cur = conn.cursor()
+            yield cur
+            cur.close()
+
+    @contextmanager
+    def transaction(self, transaction_type):
+        while self.keep_running.is_set():
+            try:
+                with self.cur() as cur:
+                    cur.execute(f'BEGIN {transaction_type} TRANSACTION')
+                    yield cur
+                    return
+            except sqlite3.OperationalError as e:
+                if 'database is locked' in str(e):
+                    time.sleep(random.random() * 10)
+                else:
+                    raise
+        raise Exception("Could not begin transaction.")
+
+    def initialize(self):
+        print(f"\tInitializing compile db {self.db_file}")
+        with self.cur() as cur:
             cur.execute('PRAGMA journal_mode=WAL')
             cur.execute('PRAGMA synchronous=NORMAL')
             cur.execute('''
@@ -72,11 +206,9 @@ class CompileDB:
                 CREATE INDEX IF NOT EXISTS idx_exec_id_done ON compilations
                         (exec_id, done)
             ''')
-            conn.commit()
 
     def get_compilation_status(self, fuzz_target, mut_id):
-        with self.connect() as conn:
-            cur = conn.cursor()
+        with self.cur() as cur:
             cur.execute(
                 'SELECT exec_id, done FROM compilations WHERE fuzz_target=? AND mut_id=?', (fuzz_target, mut_id))
             res = cur.fetchall()
@@ -86,8 +218,7 @@ class CompileDB:
         return all
 
     def is_compiled(self, fuzz_target, mut_id):
-        with self.connect() as conn:
-            cur = conn.cursor()
+        with self.cur() as cur:
             cur.execute(
                 'SELECT * FROM compilations WHERE fuzz_target=? AND mut_id=? AND done=1',
                 (fuzz_target, mut_id))
@@ -95,8 +226,7 @@ class CompileDB:
         return res is not None
         
     def get_num_compiled(self, fuzz_target):
-        with self.connect() as conn:
-            cur = conn.cursor()
+        with self.cur() as cur:
             cur.execute(
                 'SELECT COUNT(*) FROM compilations WHERE done=1 AND fuzz_target=?',
                 (fuzz_target,))
@@ -119,12 +249,8 @@ class CompileDB:
                     return True
             return False
 
-        with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute('BEGIN EXCLUSIVE TRANSACTION')
-
+        with self.transaction('EXCLUSIVE') as cur:
             if debug_num_mutants is not None:
-                cur = conn.cursor()
                 cur.execute(
                     'SELECT COUNT(*) FROM compilations WHERE done=1 AND fuzz_target=? or exec_id=? AND fuzz_target=?',
                     (fuzz_target, exec_id, fuzz_target))
@@ -146,25 +272,23 @@ class CompileDB:
 
                 cur.execute('INSERT INTO compilations (fuzz_target, mut_id, exec_id, done) VALUES (?, ?, ?, 0)',
                             (fuzz_target, mut_id, exec_id))
-                conn.execute('COMMIT TRANSACTION')
+                cur.execute('COMMIT TRANSACTION')
                 return "go"
             else:
                 cur.execute('ROLLBACK TRANSACTION')
                 return "later"
 
     def set_compiling(self, fuzz_target, mut_id, exec_id):
-        with self.connect() as conn:
-            cur = conn.cursor()
+        with self.transaction('IMMEDIATE') as cur:
             cur.execute('INSERT INTO compiling (fuzz_target, mut_id, exec_id) VALUES (?, ?, ?)',
                         (fuzz_target, mut_id, exec_id))
-            conn.commit()
+            cur.execute('COMMIT TRANSACTION')
 
     def set_finished_building(self, fuzz_target, mut_id, exec_id, build_error, build_error_msg):
-        with self.connect() as conn:
-            cur = conn.cursor()
+        with self.transaction('IMMEDIATE') as cur:
             cur.execute('UPDATE compilations SET done=1, build_error=?, build_error_msg=? WHERE fuzz_target=? AND mut_id=? AND exec_id=?',
                         (build_error, build_error_msg, fuzz_target, mut_id, exec_id))
-            conn.commit()
+            cur.execute('COMMIT TRANSACTION')
 
 
 def estimate_max_num_compiling():
@@ -186,9 +310,10 @@ def estimate_max_num_compiling():
     return min(int(max_mem_concurrent), int(max_cpu_concurrent))
 
 
-def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling):
+def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling,
+                 keep_running, _cpu):
     start_time = time.time()
-    compile_db = CompileDB(compile_db_path)
+    compile_db = CompileDB(compile_db_path, keep_running)
 
     mutant_file = mutants_dir/f'{mut_id}'
 
@@ -220,7 +345,7 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
         }], f)
     
     # build new mutant and store it in mutants_dir
-    build_command = [
+    build_cmd = [
         'pipx',
         'run',
         'hatch',
@@ -234,13 +359,14 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
         '--mutation-list',
         config_file
     ]
+    full_cmd = f'ulimit -v {BUILD_MEM_LIMIT} ; {shlex.join((str(cc) for cc in build_cmd))}'
     with tempfile.TemporaryDirectory() as tmp_dir:
         env = os.environ.copy()
         env['MUT_SHARED_DIR'] = tmp_dir
         env['MUT_HOST_TMP_PATH'] = tmp_dir
         try:
             subprocess.run(
-                build_command,
+                full_cmd,
                 cwd='/mutator',
                 env=env,
                 stderr=subprocess.STDOUT,
@@ -248,17 +374,20 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
                 errors='replace',
                 check=True,
                 timeout=MAX_BUILD_TIME,
+                shell=True,
             )
         except subprocess.CalledProcessError as e:
-            print(f"Error while building mutant: {e.output}")
             # set as finished even for errors
-            compile_db.set_finished_building(fuzz_target, mut_id, exec_id, "error", e.output)
-            return ("compile_error", time.time() - start_time, time.time() - compile_start_time, e.output)
+            compile_db.set_finished_building(fuzz_target, mut_id, exec_id, "process_error", e.output)
+            return (BUILD_RES_ERR, time.time() - start_time, time.time() - compile_start_time, e.output)
         except subprocess.TimeoutExpired as e:
-            print(f"Error while building mutant: {e.output}")
             # set as finished even for errors
             compile_db.set_finished_building(fuzz_target, mut_id, exec_id, "timeout", e.output)
-            return ("compile_error", time.time() - start_time, time.time() - compile_start_time, e.output)
+            return (BUILD_RES_ERR, time.time() - start_time, time.time() - compile_start_time, e.output)
+        except Exception as e:
+            # set as finished even for errors
+            compile_db.set_finished_building(fuzz_target, mut_id, exec_id, "exception", str(e))
+            return (BUILD_RES_ERR, time.time() - start_time, time.time() - compile_start_time, str(e))
         finally:
             #cleanup
             os.remove(config_file)
@@ -266,10 +395,10 @@ def build_mutant(mut_id, exec_id, compile_db_path, mutants_dir, fuzz_target, deb
     # set as finished even for errors
     compile_db.set_finished_building(fuzz_target, mut_id, exec_id, None, None)
     # mark mutant as compiled
-    return ("compiled", time.time() - start_time, time.time() - compile_start_time)
+    return (BUILD_RES_OK, time.time() - start_time, time.time() - compile_start_time)
 
 
-def locate_corpus_entry(corpus_entry, locator_path, corpus_dir, mutants_ids_dir):
+def locate_corpus_entry(corpus_entry, locator_path, corpus_dir, mutants_ids_dir, cpu):
     input_file = os.path.join(corpus_dir, corpus_entry)
     mutant_ids_result_file = (mutants_ids_dir / f"{Path(corpus_entry).name}.json")
     if os.path.isdir(input_file):
@@ -281,31 +410,34 @@ def locate_corpus_entry(corpus_entry, locator_path, corpus_dir, mutants_ids_dir)
     all_mut_ids = set()
     timed_out = None
     errored_out = None
+    cmd = [str(locator_path), str(input_file)]
+    full_cmd = f'ulimit -v {LOCATOR_MEM_LIMIT} ; {shlex.join(cc for cc in cmd)}'
     with tempfile.TemporaryDirectory() as trigger_dir:
         try:
             subprocess.run(
-                [str(locator_path), str(input_file)],
+                full_cmd,
                 cwd=trigger_dir,
                 timeout=LOCATOR_TIMEOUT,
                 stderr=subprocess.STDOUT,
                 stdout=subprocess.PIPE,
                 errors='replace',
                 check=True,
+                shell=True,
             )
-        except subprocess.CalledProcessError as e:
-            errored_out = str(e)
         except subprocess.TimeoutExpired as e:
             timed_out = str(e)
+        except Exception as e:
+            errored_out = str(e)
         for mut_id_file in (Path(trigger_dir)/'trigger_signal').glob("*"):
-            if not mut_id_file.is_file():
-                print(f"Mutant id file is not a file: {mut_id_file}")
-                continue
+            # if not mut_id_file.is_file():
+            #     print(f"Mutant id file is not a file: {mut_id_file}")
+            #     continue
             file_name = mut_id_file.stem
             try:
                 mut_id = int(file_name)
             except ValueError:
-                print(f"Invalid mutant id: {file_name}")
-                return
+                print(f"\tInvalid mutant id: {file_name}")
+                continue
             corpus_mut_ids.append(mut_id)
             all_mut_ids.add(mut_id)
     with open(mutant_ids_result_file, 'w') as f:
@@ -315,6 +447,11 @@ def locate_corpus_entry(corpus_entry, locator_path, corpus_dir, mutants_ids_dir)
             'timed_out': timed_out,
         }, f)
     return all_mut_ids, timed_out, errored_out
+
+
+def keep_running_initializer(keep_running):
+    global KEEP_RUNNING
+    KEEP_RUNNING = keep_running
 
 
 def main():
@@ -355,6 +492,7 @@ def main():
     debug_num_mutants = args.debug_num_mutants
 
     shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
+    cpu_db_path = shared_mua_binaries_dir / 'cpus.sqlite'
     compile_db_path = shared_mua_binaries_dir / 'compile.sqlite'
     corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / benchmark / fuzzer / trial_num
@@ -367,7 +505,15 @@ def main():
     max_num_compiling = estimate_max_num_compiling()
     print(f"\tEstimating maximum number of concurrent compilations: {max_num_compiling}")
 
-    compile_db = CompileDB(compile_db_path)
+    cpu_running = threading.Event()
+    cpu_running.set()
+    keep_running = threading.Event()
+    keep_running.set()
+    cpu_keep_running_proc = multiprocessing.Event()
+    cpu_keep_running_proc.set()
+    cpu_db = CpuDB(cpu_db_path, keep_running)
+    cpu_db.initialize()
+    compile_db = CompileDB(compile_db_path, keep_running)
     compile_db.initialize()
 
     all_mut_ids = set()
@@ -377,33 +523,64 @@ def main():
     # execute corpus with locator
     corpus_list = os.listdir(corpus_dir)
     corpus_len = len(corpus_list)
-    locate_jobs = []
-    with ThreadPoolExecutor(max_workers=int(multiprocessing.cpu_count())) as executor:
-        for corpus_entry in corpus_list:
-            locate_jobs.append(executor.submit(
-                locate_corpus_entry, corpus_entry, locator_path, corpus_dir, mutants_ids_dir))
-
+    locate_jobs = {}
+    assigned_cpus = []
+    available_cpus = []
     completed_count = 0
     successful_count = 0
     timeout_count = 0
     errored_count = 0
-    for job in as_completed(locate_jobs):
-        try:
-            res = job.result()
-        except Exception as e:
-            stacktrace = traceback.format_exc()
-            print(f"Error while locating corpus entry: {e}:\n{stacktrace}")
-            res = None
-        if res is not None:
-            found_mut_ids, timed_out, errored_out = res
-            all_mut_ids.update(found_mut_ids)
-            if timed_out is not None:
-                timeout_count += 1
-            if errored_out is not None:
-                errored_count += 1
-            if not (timed_out or errored_out):
-                successful_count += 1
-        completed_count += 1
+    try:
+        with ProcessPoolExecutor(
+                max_workers=int(multiprocessing.cpu_count()), initializer=keep_running_initializer,
+                initargs=(cpu_keep_running_proc,)
+            ) as executor:
+            locate_jobs[executor.submit(get_cpu_proc, cpu_db_path)] = ("cpu",)
+            while True:
+                if len(available_cpus) > 0 and len(corpus_list) > 0:
+                    cpu = available_cpus.pop()
+                    corpus_entry = corpus_list.pop()
+                    locate_jobs[executor.submit(
+                        locate_corpus_entry, corpus_entry, locator_path, corpus_dir, mutants_ids_dir, cpu
+                    )] = ("locate", cpu)
+                    if len(corpus_list) == 0:
+                        cpu_keep_running_proc.clear()
+                        stop_all_cpu_jobs(locate_jobs, cpu_db)
+
+                if len(corpus_list) == 0 and len(locate_jobs) == 0:
+                    break
+
+                job = next(as_completed(locate_jobs))
+                job_meta = locate_jobs.pop(job)
+                job_type = job_meta[0]
+                if job_type == "cpu":
+                    new_cpu = job.result()
+                    assigned_cpus.append(new_cpu)
+                    available_cpus.append(new_cpu)
+                    if len(corpus_list) > 0:
+                        locate_jobs[executor.submit(get_cpu_proc, cpu_db_path)] = ("cpu",)
+                elif job_type == "locate":
+                    try:
+                        res = job.result()
+                    except Exception as e:
+                        stacktrace = traceback.format_exc()
+                        print(f"\tError while locating corpus entry: {e}:\n{stacktrace}")
+                        res = None
+                    available_cpus.append(job_meta[1])
+                    if res is not None:
+                        found_mut_ids, timed_out, errored_out = res
+                        all_mut_ids.update(found_mut_ids)
+                        if timed_out is not None:
+                            timeout_count += 1
+                        if errored_out is not None:
+                            errored_count += 1
+                        if not (timed_out or errored_out):
+                            successful_count += 1
+                    completed_count += 1
+    finally:
+        print(f"\tReleasing {assigned_cpus=}")
+        for cpu in assigned_cpus:
+            cpu_db.release_cpu(cpu)
 
     print(f"\tLocator: All completed for {fuzz_target} {experiment} {fuzzer} {trial_num}:")
     print(f"\t{completed_count}/{corpus_len} corpus entries in {time.time() - locate_start_time:.2f}s.")
@@ -414,35 +591,76 @@ def main():
 
     if debug_num_mutants is not None and len(all_mut_ids) > debug_num_mutants:
         print(f"\tfor debugging reducing num of all_mut_ids: {len(all_mut_ids)} to {debug_num_mutants}")
-        all_mut_ids = random.sample(list(all_mut_ids), debug_num_mutants)
+        all_mut_ids = set(random.sample(list(all_mut_ids), debug_num_mutants))
         print(f"\tall_mut_ids: {len(all_mut_ids)}")
 
     build_start_time = time.time()
 
+    cpu_running.set()
     mutations_to_compile = set()
     # build mutants
-    build_jobs = []
-    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()*2) as executor:
-        for mut_id in all_mut_ids:
-            mutations_to_compile.add(mut_id)
-            build_jobs.append(executor.submit(build_mutant, mut_id, exec_id_bytes, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling))
-
     job_results = Counter()
     total_build_time = 0
     total_thread_time = 0
-    for job in as_completed(build_jobs):
-        try:
-            res = job.result()
-        except Exception as e:
-            stacktrace = traceback.format_exc()
-            print(f"Error while building mutant: {e}:\n{stacktrace}")
+    build_jobs = {}
+    assigned_cpus = []
+    available_cpus = []
+    try:
+        with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+            build_jobs[executor.submit(get_cpu, cpu_db_path, cpu_running, keep_running)] = ("cpu",)
+            while True:
+                try:
+                    cpu = available_cpus.pop()
+                except IndexError:
+                    cpu = None
+                if cpu is not None:
+                    try:
+                        mut_id = all_mut_ids.pop()
+                    except KeyError:
+                        mut_id = None
+                    if mut_id is not None:
+                        mutations_to_compile.add(mut_id)
+                        build_jobs[executor.submit(
+                            build_mutant, mut_id, exec_id_bytes, compile_db_path, mutants_dir, fuzz_target, debug_num_mutants, max_num_compiling, keep_running, cpu
+                        )] = ("build", cpu, mut_id)
+                    else:
+                        cpu_running.clear()
+                        stop_all_cpu_jobs(build_jobs, cpu_db)
 
-        res_type = res[0]
-        job_results[res_type] += 1
-        if res_type in ['compiled', 'compile_error']:
-            total_build_time += res[2]
-        if res_type in ['started', 'debug_num_mutants reached', 'compile_error', 'compiled']:
-            total_thread_time += res[1]
+                if len(build_jobs) == 0:
+                    break
+
+                job = next(as_completed(build_jobs))
+                job_meta = build_jobs.pop(job)
+                job_type = job_meta[0]
+                if job_type == "cpu":
+                    new_cpu = job.result()
+                    assigned_cpus.append(new_cpu)
+                    available_cpus.append(new_cpu)
+                    if len(all_mut_ids) > 0:
+                        build_jobs[executor.submit(get_cpu, cpu_db_path, cpu_running, keep_running)] = ("cpu",)
+                elif job_type == "build":
+                    try:
+                        res = job.result()
+                    except Exception as e:
+                        stacktrace = traceback.format_exc()
+                        print(f"\tError while building mutant: {e}:\n{stacktrace}")
+                        res = None
+                    available_cpus.append(job_meta[1])
+                    if res is not None:
+                        res_type = res[0]
+                        job_results[res_type] += 1
+                        if res_type in [BUILD_RES_OK, BUILD_RES_ERR]:
+                            total_build_time += res[2]
+                            mut_id = job_meta[2]
+                            mutations_to_compile.remove(mut_id)
+                        if res_type in ['started', 'debug_num_mutants reached', BUILD_RES_OK, BUILD_RES_ERR]:
+                            total_thread_time += res[1]
+    finally:
+        print(f"\tReleasing {assigned_cpus=}")
+        for cpu in assigned_cpus:
+            cpu_db.release_cpu(cpu)
+
 
     if debug_num_mutants is not None:
         while True:
@@ -479,6 +697,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\tError: {e}")
         traceback.print_exc()
         raise e
