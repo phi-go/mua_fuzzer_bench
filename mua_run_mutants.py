@@ -451,12 +451,6 @@ def main():
                     active_run_jobs += 1
                     run_jobs[executor.submit(do_run_partial, mut_chunk)] = "gen"
 
-                # while runner_count <= num_runner_threads \
-                #         and ((len(todo_list) > RUN_CHUNK_SIZE) or (gen_count == 0 and len(todo_list) > 0)):
-                #     todo_chunk, todo_list = todo_list[:RUN_CHUNK_SIZE], todo_list[RUN_CHUNK_SIZE:]
-                #     run_jobs[runner_executor.submit(run_inputs_partial, todo_chunk)] = "run"
-                #     runner_count += 1
-
                 if len(mutant_id_files_todo) == 0 \
                         and len(todo_list) == 0 \
                         and active_run_jobs == 0 \
@@ -477,10 +471,10 @@ def main():
                     stopping_thread = threading.Thread(target=stop_running)
                     stopping_thread.start()
 
-                if time.time() - last_print > 1:
-                    time_since_start = time.time() - run_jobs_start
-                    print(f"\t{time_since_start:.2f} {active_run_jobs=}, {len(mutant_id_files_todo)=},\n\t{stats=}")
-                    last_print = time.time()
+                # if time.time() - last_print > 1:
+                #     time_since_start = time.time() - run_jobs_start
+                #     print(f"\t{time_since_start:.2f} {active_run_jobs=}, {len(mutant_id_files_todo)=},\n\t{stats=}")
+                #     last_print = time.time()
 
                 try:
                     job = next(as_completed(run_jobs))
