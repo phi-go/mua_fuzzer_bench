@@ -4,6 +4,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 import os, argparse, subprocess, json
 import shlex
 import random
@@ -18,114 +19,10 @@ import sqlite3
 
 MAPPED_DIR = Path('/mapped/')
 RUN_TIMEOUT = 1
-ID_CHUNK_SIZE = 5
-RUN_CHUNK_SIZE = 200
+ID_CHUNK_SIZE = 1
+RUN_CHUNK_SIZE = 35
 MAX_RUNNER_RUNTIME = RUN_CHUNK_SIZE * RUN_TIMEOUT * 2
 MEM_LIMIT = 512 * 1024  # 512 MB
-
-
-# CPU Management Begin
-class CpuDB:
-    def __init__(self, db_file, keep_running):
-        self.db_file = db_file
-        self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=300)
-        self.keep_running = keep_running
-
-    @contextmanager
-    def cur(self):
-        with self.conn as conn:
-            cur = conn.cursor()
-            yield cur
-            cur.close()
-
-    @contextmanager
-    def transaction(self, transaction_type):
-        while self.keep_running.is_set():
-            try:
-                with self.cur() as cur:
-                    cur.execute(f'BEGIN {transaction_type} TRANSACTION')
-                    yield cur
-                    return
-            except sqlite3.OperationalError as e:
-                if 'database is locked' in str(e):
-                    time.sleep(random.random() * 10)
-                else:
-                    raise
-        raise Exception("Could not begin transaction.")
-
-    def initialize(self):
-        print(f"\tInitializing compile db {self.db_file}")
-        with self.cur() as cur:
-            cur.execute('PRAGMA journal_mode=WAL')
-            cur.execute('PRAGMA synchronous=NORMAL')
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS cpus (
-                    core INTEGER PRIMARY KEY,
-                    in_use INTEGER
-                )
-            ''')
-                        
-            cur.execute('''
-                CREATE INDEX IF NOT EXISTS idx_cpus_used ON cpus
-                        (in_use, core)
-            ''')
-
-        with self.transaction('EXCLUSIVE') as cur:
-            cpu_count = multiprocessing.cpu_count()
-            for ii in range(cpu_count):
-                cur.execute('INSERT OR IGNORE INTO cpus (core, in_use) VALUES (?, 0)', (ii,))
-        
-    def get_free_cpu(self):
-        with self.transaction('EXCLUSIVE') as cur:
-            cur.execute('''
-                SELECT core FROM cpus WHERE in_use = 0
-                ORDER BY core ASC LIMIT 1
-            ''')
-            row = cur.fetchone()
-            if row:
-                cur.execute('UPDATE cpus SET in_use = 1 WHERE core = ?', (row[0],))
-                return row[0]
-            else:
-                return None
-
-    def release_cpu(self, core):
-        with self.transaction('IMMEDIATE') as cur:
-            cur.execute('UPDATE cpus SET in_use = 0 WHERE core = ?', (core,))
-
-
-@contextmanager
-def get_cpu(cpu_db_path, cpu_running):
-    keep_running = threading.Event()
-    keep_running.set()
-    cpu_db = CpuDB(cpu_db_path, keep_running)
-    while cpu_running.is_set():
-        new_cpu = cpu_db.get_free_cpu()
-        if new_cpu is not None:
-            yield new_cpu
-            cpu_db.release_cpu(new_cpu)
-            break
-        time.sleep(random.random() * 2)
-    else: # no break
-        yield None
-
-
-def stop_all_cpu_jobs(jobs, cpu_db):
-    # stop all get_cpu jobs
-    print(f"\tStopping all cpu jobs")
-    removed_jobs = []
-    for job in jobs:
-        if jobs[job][0] == "cpu":
-            if job.cancel():
-                removed_jobs.append(job)
-            else:
-                chosen_cpu = job.result()
-                print(f"\tImmediately releasing {chosen_cpu=}")
-                if chosen_cpu is not None:
-                    cpu_db.release_cpu(chosen_cpu)
-                removed_jobs.append(job)
-    for job in removed_jobs:
-        jobs.pop(job)
-# CPU Management End
 
 
 @dataclass
@@ -355,86 +252,112 @@ def run_input(tmpdir, input_file, original_executable, mutant_executable):
     )
 
 
-def run_inputs(results_db, tmpdir, original_executable, mutants_dir, fuzz_target, keep_running, chunk, cpu_db_path):
-    with get_cpu(cpu_db_path, keep_running) as chosen_cpu:
-        if chosen_cpu is None:
-            raise ValueError("Could not get cpu")
-        results_db = ResultDB(results_db, keep_running)
-        result_counter = Counter()
-        results = []
-        for input_file, input_file_id, mut_id in chunk:
-            mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
-            res = run_input(
-                tmpdir, input_file, original_executable, mutant_executable)
-            results.append((input_file_id, mut_id, res))
-            result_counter["done"] += 1
+def run_inputs(results_db, tmpdir, original_executable, mutants_dir, fuzz_target, keep_running, chunk):
+    results_db = ResultDB(results_db, keep_running)
+    result_counter = Counter()
+    results = []
+    for input_file, input_file_id, mut_id in chunk:
+        mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
+        res = run_input(
+            tmpdir, input_file, original_executable, mutant_executable)
+        results.append((input_file_id, mut_id, res))
+        result_counter["done"] += 1
 
-        results_db.add_all_results(results)
-        return result_counter
+    results_db.add_all_results(results)
+    return result_counter
 
 # for corpus entry in mutants_ids_dir run entry on each covered mutant
 # check if corpus entry has already been run, if so skip
 # else add corpus entry for each mutant to jobs
 def gather_run_jobs_chunk(
-    corpus_mutant_id_files, corpus_dir, mutants_dir, fuzz_target, result_db_path, cpu_db_path
+    corpus_mutant_id_files, corpus_dir, mutants_dir, fuzz_target, results_db
+):
+    stats = Counter()
+    todo_run_jobs = []
+    skipped = []
+    earliest_kill_cache = {}
+    for corpus_mutant_ids_file in corpus_mutant_id_files:
+        if corpus_mutant_ids_file.is_dir():
+            continue
+        input_file = os.path.join(corpus_dir, corpus_mutant_ids_file.name[:-5])
+
+        if not Path(input_file).is_file():
+            print(f"\tcorpus mutant ids file {corpus_mutant_ids_file} has no input file {input_file}")
+            stats.update(["no_input"])
+            continue
+
+        input_file_name = Path(input_file).name
+
+        with open(corpus_mutant_ids_file, 'r') as f:
+            try:
+                input_mutant_ids = json.load(f)['mut_ids']
+            except Exception as e:
+                print(f"\tError loading json file {corpus_mutant_ids_file}: {e}")
+                stats.update(["no_json"])
+                continue
+        hashname_info = results_db.get_info_for_hashname(input_file_name)
+        if hashname_info is None:
+            stats.update(["(no_timestamp)"])
+            continue
+            # print(f"Could not find timestamp for input file: {input_file}")
+        input_file_id, file_timestamp = hashname_info
+        all_done_for_file = results_db.get_all_done_for_file(input_file_id)
+        for mut_id in input_mutant_ids:
+            if mut_id in all_done_for_file:
+                # print(f"corpus input file {input_file} has already been run")
+                stats.update(["outside_already_done"])
+                continue
+            if mut_id in earliest_kill_cache:
+                earliest_kill = earliest_kill_cache[mut_id]
+            else:
+                earliest_kill = results_db.get_earliest_timestamp_killing_mutant(mut_id)
+                earliest_kill_cache[mut_id] = earliest_kill
+            if earliest_kill is not None:
+                    if file_timestamp >= earliest_kill:
+                        skipped.append((input_file_id, mut_id))
+                        stats["skipped"] += 1
+                        continue
+            mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
+            if not mutant_executable.is_file():
+                # print(f"mutant file {mutant_executable} does not exist")  # TODO this is noisy for debug
+                stats.update(["no_mutant_executable"])
+                continue
+            todo_run_jobs.append((input_file, input_file_id, mut_id))
+    return todo_run_jobs, stats, skipped
+
+
+def do_run(
+    corpus_dir, mutants_dir, fuzz_target, result_db_path, tmpdir, original_executable, mut_chunk
 ):
     keep_running = KEEP_RUNNING
-    with get_cpu(cpu_db_path, keep_running) as chosen_cpu:
-        if chosen_cpu is None:
-            raise ValueError("Could not get cpu")
-        results_db = ResultDB(result_db_path, keep_running)
-        stats = Counter()
-        todo_run_jobs = []
-        skipped = []
-        earliest_kill_cache = {}
-        for corpus_mutant_ids_file in corpus_mutant_id_files:
-            if corpus_mutant_ids_file.is_dir():
+    results_db = ResultDB(result_db_path, keep_running)
+    todo_run_jobs, stats, skipped = gather_run_jobs_chunk(
+        mut_chunk, corpus_dir, mutants_dir, fuzz_target, results_db
+    )
+    results_db.add_all_skipped(skipped)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        run_inputs_partial = partial(run_inputs,
+                                     result_db_path, tmpdir, original_executable, mutants_dir, fuzz_target,
+                                     keep_running)
+        run_jobs = {}
+        while True:
+            chunk, todo_run_jobs = todo_run_jobs[:RUN_CHUNK_SIZE], todo_run_jobs[RUN_CHUNK_SIZE:]
+            if len(chunk) == 0:
+                break
+            run_jobs[executor.submit(run_inputs_partial, chunk)] = "run"
+        for job in as_completed(run_jobs):
+            job_meta = run_jobs[job]
+            del[run_jobs[job]]
+            try:
+                res = job.result()
+            except Exception as e:
+                stacktrace = traceback.format_exc()
+                print(f"\tError during '{job_meta}' job: {e}:\n{stacktrace}")
                 continue
-            input_file = os.path.join(corpus_dir, corpus_mutant_ids_file.name[:-5])
+            if job_meta == "run":
+                stats.update(res)
+    return stats
 
-            if not Path(input_file).is_file():
-                print(f"\tcorpus mutant ids file {corpus_mutant_ids_file} has no input file {input_file}")
-                stats.update(["no_input"])
-                continue
-
-            input_file_name = Path(input_file).name
-
-            with open(corpus_mutant_ids_file, 'r') as f:
-                try:
-                    input_mutant_ids = json.load(f)['mut_ids']
-                except Exception as e:
-                    print(f"\tError loading json file {corpus_mutant_ids_file}: {e}")
-                    stats.update(["no_json"])
-                    continue
-            hashname_info = results_db.get_info_for_hashname(input_file_name)
-            if hashname_info is None:
-                stats.update(["(no_timestamp)"])
-                continue
-                # print(f"Could not find timestamp for input file: {input_file}")
-            input_file_id, file_timestamp = hashname_info
-            all_done_for_file = results_db.get_all_done_for_file(input_file_id)
-            for mut_id in input_mutant_ids:
-                if mut_id in all_done_for_file:
-                    # print(f"corpus input file {input_file} has already been run")
-                    stats.update(["outside_already_done"])
-                    continue
-                if mut_id in earliest_kill_cache:
-                    earliest_kill = earliest_kill_cache[mut_id]
-                else:
-                    earliest_kill = results_db.get_earliest_timestamp_killing_mutant(mut_id)
-                    earliest_kill_cache[mut_id] = earliest_kill
-                if earliest_kill is not None:
-                        if file_timestamp >= earliest_kill:
-                            skipped.append((input_file_id, mut_id))
-                            stats["skipped"] += 1
-                            continue
-                mutant_executable = mutants_dir / str(mut_id) / f'{fuzz_target}_{mut_id}'
-                if not mutant_executable.is_file():
-                    # print(f"mutant file {mutant_executable} does not exist")  # TODO this is noisy for debug
-                    stats.update(["no_mutant_executable"])
-                    continue
-                todo_run_jobs.append((input_file, input_file_id, mut_id))
-    return todo_run_jobs, stats, skipped
 
 
 def split_list(lst, num_chunks):
@@ -485,17 +408,12 @@ def main():
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids'/ benchmark / fuzzer / trial_num
     corpus_run_results = shared_mua_binaries_dir / 'corpus_run_results' / fuzzer / trial_num
     result_db_path = corpus_run_results / f'results.sqlite'
-    cpu_db_path = shared_mua_binaries_dir / 'cpus.sqlite'
 
     keep_running_runner = threading.Event()
     keep_running_runner.set()
 
     keep_running_gen = multiprocessing.Event()
     keep_running_gen.set()
-    cpu_keep_running = threading.Event()
-    cpu_keep_running.set()
-    cpu_db = CpuDB(cpu_db_path, cpu_keep_running)
-    cpu_db.initialize()
     results_db = ResultDB(result_db_path, keep_running_runner)
     results_db.initialize(benchmark, fuzz_target, fuzzer, trial_num)
     mutants_dir = shared_mua_binaries_dir / 'mutants' / benchmark
@@ -505,61 +423,64 @@ def main():
 
     stats = Counter()
 
-    run_jobs_start = time.time()
-    num_producer_processes = max(int(os.cpu_count() * 0.1), 1)
-    num_runner_threads = os.cpu_count() - num_producer_processes
+    num_run_processes = os.cpu_count()
 
     mutant_id_files = list(mutants_ids_dir.glob('*'))
     print(f"\t{len(mutant_id_files)=}")
-    mutant_id_chunks = chunks(mutant_id_files, ID_CHUNK_SIZE)
+    mutant_id_files_todo = mutant_id_files.copy()
     stopping_thread = None
+
+    last_print = time.time()
     
     # run mutants
+    run_jobs_start = time.time()
     with tempfile.TemporaryDirectory() as tmpdir:
-        gen_count = 0
+        do_run_partial = partial(do_run, corpus_dir, mutants_dir, fuzz_target, result_db_path, tmpdir, original_executable)
+        active_run_jobs = 0
         runner_count = 0
         run_jobs = {}
         todo_list = []
-        with ThreadPoolExecutor(max_workers=num_runner_threads) as runner_executor, \
-             ProcessPoolExecutor(
-                 max_workers=num_producer_processes, initializer=keep_running_initializer, initargs=(keep_running_gen,)
-                 ) as gen_executor:
+        with ProcessPoolExecutor(
+                 max_workers=num_run_processes, initializer=keep_running_initializer, initargs=(keep_running_gen,)
+                 ) as executor:
             while True:
-                while gen_count <= num_producer_processes * 2 \
-                        and len(todo_list) < (RUN_CHUNK_SIZE * num_runner_threads):
-                    try:
-                        mut_chunk = next(mutant_id_chunks)
-                    except StopIteration:
-                        break # all chunks submitted
-                    gen_count += 1
-                    run_jobs[gen_executor.submit(
-                        gather_run_jobs_chunk,
-                        mut_chunk, corpus_dir, mutants_dir, fuzz_target, result_db_path, cpu_db_path
-                    )] = "gen"
+                while active_run_jobs <= num_run_processes:
+                    mut_chunk, mutant_id_files_todo = mutant_id_files_todo[:ID_CHUNK_SIZE], mutant_id_files_todo[ID_CHUNK_SIZE:]
+                    if len(mut_chunk) == 0:
+                        break
+                    active_run_jobs += 1
+                    run_jobs[executor.submit(do_run_partial, mut_chunk)] = "gen"
 
-                if runner_count <= num_runner_threads:
-                    if (len(todo_list) > RUN_CHUNK_SIZE) or (gen_count == 0 and len(todo_list) > 0):
-                        todo_chunk, todo_list = todo_list[:RUN_CHUNK_SIZE], todo_list[RUN_CHUNK_SIZE:]
-                        run_jobs[runner_executor.submit(
-                            run_inputs, result_db_path, tmpdir, original_executable, mutants_dir, fuzz_target, keep_running_runner, todo_chunk, cpu_db_path
-                        )] = "run"
-                        runner_count += 1
-                    elif gen_count == 0 and len(todo_list) == 0 and stopping_thread is None:
-                        # everything has been generated and all runners are started
-                        # start a thread that set keep_running to false when max runtime is reached
-                        def stop_running():
-                            start_time = time.time()
-                            while time.time() - start_time < MAX_RUNNER_RUNTIME:
-                                if not keep_running_runner.is_set():
-                                    return
-                                time.sleep(1)
-                            print(f"\tClearing keep_running")
-                            keep_running_gen.clear()
-                            keep_running_runner.clear()
+                # while runner_count <= num_runner_threads \
+                #         and ((len(todo_list) > RUN_CHUNK_SIZE) or (gen_count == 0 and len(todo_list) > 0)):
+                #     todo_chunk, todo_list = todo_list[:RUN_CHUNK_SIZE], todo_list[RUN_CHUNK_SIZE:]
+                #     run_jobs[runner_executor.submit(run_inputs_partial, todo_chunk)] = "run"
+                #     runner_count += 1
 
-                        print(f"\tStarting stop_running thread")
-                        stopping_thread = threading.Thread(target=stop_running)
-                        stopping_thread.start()
+                if len(mutant_id_files_todo) == 0 \
+                        and len(todo_list) == 0 \
+                        and active_run_jobs == 0 \
+                        and stopping_thread is None:
+                    # everything has been generated and all runners are started
+                    # start a thread that set keep_running to false when max runtime is reached
+                    def stop_running():
+                        start_time = time.time()
+                        while time.time() - start_time < MAX_RUNNER_RUNTIME:
+                            if not keep_running_runner.is_set():
+                                return
+                            time.sleep(1)
+                        print(f"\tClearing keep_running")
+                        keep_running_gen.clear()
+                        keep_running_runner.clear()
+
+                    print(f"\tStarting stop_running thread")
+                    stopping_thread = threading.Thread(target=stop_running)
+                    stopping_thread.start()
+
+                if time.time() - last_print > 1:
+                    time_since_start = time.time() - run_jobs_start
+                    print(f"\t{time_since_start:.2f} {active_run_jobs=}, {len(mutant_id_files_todo)=},\n\t{stats=}")
+                    last_print = time.time()
 
                 try:
                     job = next(as_completed(run_jobs))
@@ -575,11 +496,9 @@ def main():
                     print(f"\tError during '{job_meta}' job: {e}:\n{stacktrace}")
                     continue
                 if job_meta == "gen":
-                    gen_count -= 1
-                    assert gen_count >= 0
-                    todo_list.extend(res[0])
-                    stats.update(res[1])
-                    results_db.add_all_skipped(res[2])
+                    active_run_jobs -= 1
+                    assert active_run_jobs >= 0
+                    stats.update(res)
                 elif job_meta == "run":
                     runner_count -= 1
                     assert runner_count >= 0
@@ -593,6 +512,11 @@ def main():
     for msg, cnt in stats.most_common():
         print(f"\t\t{msg}: {cnt}")
     print(f"\tmua run time: {time.time() - start_time:0.2f}s")
+    try:
+        done_jobs = stats["done"]
+        print(f"\t{done_jobs / (time.time() - run_jobs_start):0.2f} done/s")
+    except KeyError:
+        pass
         
 
 if __name__ == "__main__":
