@@ -31,6 +31,43 @@ class CompilationStatus:
     done: bool
 
 
+class MeasureRunsDB:
+    def __init__(self, db_file, keep_running):
+        print(f"\tInitializing measure db: {db_file}")
+        self.db_file = db_file
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=300)
+        self.keep_running = keep_running
+
+    @contextmanager
+    def cur(self):
+        with self.conn as conn:
+            cur = conn.cursor()
+            yield cur
+            cur.close()
+
+    @contextmanager
+    def transaction(self, transaction_type):
+        while self.keep_running.is_set():
+            try:
+                with self.cur() as cur:
+                    cur.execute(f'BEGIN {transaction_type} TRANSACTION')
+                    yield cur
+                    return
+            except sqlite3.OperationalError as e:
+                if 'database is locked' in str(e):
+                    time.sleep(random.random() * 10)
+                else:
+                    raise
+        raise Exception("Could not begin transaction.")
+
+    def add_all_covered(self, trial_id, mut_ids):
+        with self.transaction('EXCLUSIVE') as cur:
+            for mut_id in mut_ids:
+                cur.execute('INSERT OR IGNORE INTO covered_muts (trial_id, covered_mut) VALUES (?, ?)',
+                            (trial_id, mut_id))
+            cur.execute('COMMIT TRANSACTION')
+
+
 class CompileDB:
     def __init__(self, db_file, keep_running):
         self.db_file = db_file
@@ -381,6 +418,7 @@ def main():
 
     shared_mua_binaries_dir = MAPPED_DIR / experiment / 'mua-results'
     compile_db_path = shared_mua_binaries_dir / 'compile.sqlite'
+    measure_runs_db_path = shared_mua_binaries_dir / 'measure_runs.sqlite'
     corpus_dir = shared_mua_binaries_dir / 'corpi' / fuzzer / trial_num
     mutants_ids_dir = shared_mua_binaries_dir / 'mutant_ids' / benchmark / fuzzer / trial_num
     mutants_ids_dir.mkdir(parents=True, exist_ok=True)
@@ -396,6 +434,7 @@ def main():
     keep_running.set()
     compile_db = CompileDB(compile_db_path, keep_running)
     compile_db.initialize()
+    measure_runs_db = MeasureRunsDB(measure_runs_db_path, keep_running)
 
     all_mut_ids = set()
 
@@ -443,6 +482,8 @@ def main():
                 completed_count += 1
             else:
                 raise Exception(f"Unknown job type: {job_type}")
+
+    measure_runs_db.add_all_covered(trial_num, all_mut_ids)
 
     print(f"\tLocator: All completed for {fuzz_target} {experiment} {fuzzer} {trial_num}:")
     print(f"\t{completed_count}/{corpus_len} corpus entries in {time.time() - locate_start_time:.2f}s.")
