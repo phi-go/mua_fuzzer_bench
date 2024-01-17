@@ -72,7 +72,7 @@ KEEP_VALUE_ARGS = [
 KEEP_SINGLE_ARGS = [
     "-fPIE", "-pthread",
     "-stdlib", "-fdiagnostics-color",
-    "-m64"
+    "-m64", "-rdynamic",
 ]
 
 IGNORE_VALUE_ARGS = [
