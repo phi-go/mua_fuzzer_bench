@@ -183,7 +183,7 @@ def main():
                 executable_path = Path(cmd[o_args_idx + 1])
                 print(f"Found candidate executable: {executable_path}")
                 candidates.append((cmd, env, executable_path))
-    executables = []
+    executables = {}
     for cmd, env, executable_path in candidates:
         if fuzz_target is not None:
             if fuzz_target != executable_path.name:
@@ -194,15 +194,19 @@ def main():
         print(f"cmd: {cmd}")
         print(f"env: {env}")
         bc_path = extract_bc(executable_path, env.get('PWD', None), out)
+        exec_name = bc_path.stem
         print(f"Extracted bitcode to {bc_path}")
-        executables.append((cmd, env, bc_path))
+        if exec_name not in executables:
+            executables[exec_name] = (cmd, env, bc_path)
 
     assert len(executables) > 0, "No bitcode files found!"
 
+    print("Executables:")
+    pprint(executables)
+
     # Create config for each executable bc
     config = {}
-    for cmd, _env, bc_path in executables:
-        exec_name = Path(bc_path).stem
+    for exec_name, (cmd, _env, bc_path) in executables.items():
 
         is_cpp = None
         if cmd[0].endswith('gclang++'):
@@ -223,7 +227,7 @@ def main():
             "omit_functions": ["main", "LLVMFuzzerTestOneInput"]
         }
 
-        assert exec_name not in config
+        assert exec_name not in config, f"current: {config}, new: {exec_name} -> {exec_config}"
         config[exec_name] = exec_config
 
     print(f"Config (written to: {CONFIG_PATH}):")
